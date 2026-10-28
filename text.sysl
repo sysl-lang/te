@@ -1,0 +1,540 @@
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, File, create, metadata, set_permissions, pending_name, publish_file, remove_file}
+import sysl.math.{min, max}
+
+// The text being edited: a piece table held as a balanced persistent tree.
+//
+// **Nothing is ever copied out of the file.** The bytes a document holds live in its *sources*: the
+// files it has been mapped from (`Mapping`), and one *add buffer* every inserted byte is appended to
+// and never removed from. The document itself is a sequence of *pieces*, each a run of one source's
+// bytes, in reading order. An insert appends to the add buffer and splices one piece in; a delete
+// leaves the bytes where they are and splices pieces out.
+//
+// **The sequence is a treap**: a binary tree in reading order whose nodes are also heap-ordered by a
+// random priority, which keeps it balanced in expectation, so every splice and every query is
+// O(log n) in the number of pieces. Splitting and joining are the only two operations, and every edit
+// is two splits and two joins.
+//
+// **The tree is persistent**: an edit never changes a node, it builds the nodes on the path it walked
+// afresh and shares the rest with the tree before it. So every version of the document is one root,
+// a version costs O(log n) nodes, and undo is going back to the root before.
+//
+// **Each node caches its subtree's byte count and newline count**, which is what turns an offset into
+// a line and a line into an offset in O(log n). The byte counts are always known. **Newline counts are
+// not counted when a file is opened**, because counting means reading every byte, and opening a file
+// of any size has to be instant: the file arrives as pieces of `block_bytes` each, every one with its
+// count unknown. A count is worked out the first time a line query needs it -- a piece's bytes are
+// counted and stored in the node, and a subtree's sum is stored once all of its pieces are known -- so
+// a query near the top of a file reads only the pieces before it, and every byte is counted at most
+// once. A filled-in count is a cache of something the node's immutable bytes already determine, so
+// storing it into a node every version shares changes no version's meaning.
+//
+// **A line ends at `\n`.** CRLF is one line break, because the break is the `\n` and the `\r` before
+// it is not part of the line's text (`line_end`); a lone `\r` is an ordinary character. A column is a
+// count of code points from the start of the line, and no query answers an offset inside a UTF-8
+// sequence.
+
+/** How large the pieces a file is mapped as are. Small enough that splitting one to count part of it
+ * is cheap, large enough that a file of many gigabytes is a few thousand of them.
+ */
+const block_bytes: u64 = 1 << 20
+
+/** One piece and the subtree under it. `src` 0 is the add buffer and `src` k is `sources[k - 1]`.
+ * `lines` is the piece's own newline count and `sub` the subtree's, -1 while not yet counted. All the
+ * other fields are fixed when the node is built.
+ */
+struct Node
+    left: Option[&Node]
+    right: Option[&Node]
+    prio: u64
+    src: usize
+    start: u64
+    len: u64
+    lines: i64
+    bytes: u64
+    sub: i64
+
+/** A run of one source, as the pieces of a freshly mapped file are described before they are built
+ * into a tree.
+ */
+struct Run
+    start: u64
+    len: u64
+    lines: i64
+
+private bytes_of(n: Option[&Node]) -> u64 = n match
+    Some(x) -> x.bytes
+    None -> 0
+
+private sub_of(n: Option[&Node]) -> i64 = n match
+    Some(x) -> x.sub
+    None -> 0
+
+private node(prio: u64, src: usize, start: u64, len: u64, lines: i64, left: Option[&Node], right: Option[&Node]) -> &Node
+    val below = if lines < 0 || sub_of(left) < 0 || sub_of(right) < 0 then -1 else sub_of(left) + lines + sub_of(right)
+
+    Node(left, right, prio, src, start, len, lines, bytes_of(left) + len + bytes_of(right), below)
+
+/** `x`'s piece over new children. */
+private with(x: &Node, left: Option[&Node], right: Option[&Node]) -> &Node =
+    node(x.prio, x.src, x.start, x.len, x.lines, left, right)
+
+/** The tree holding everything in `a` followed by everything in `b`. */
+private join(a: Option[&Node], b: Option[&Node]) -> Option[&Node]
+    if a is Some(x)
+        if b is Some(y)
+            return Some(if x.prio > y.prio then with(x, x.left, join(x.right, b)) else with(y, join(a, y.left), y.right))
+        return a
+    b
+
+private height(n: Option[&Node]) -> u64 = n match
+    Some(x) -> 1 + max(height(x.left), height(x.right))
+    None -> 0
+
+private is_continuation(b: u8) -> bool = (b & 0xC0) == 0x80
+
+/** Where in `bytes` the `k`th newline is, counting from 1; `k` is at least 1 and at most the count. */
+private nth_newline(bytes: []const u8, k: i64) -> u64
+    var seen = 0
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('\n')
+            seen += 1
+            if seen == k then return u64(i)
+
+    u64(bytes.len)
+
+/** A document: its sources, its current text, and every version undo can go back to. */
+struct Text
+    /** Where `save` writes. */
+    path: string
+
+    /** The size of the pieces a file is mapped as (`block_bytes`). */
+    block: u64
+
+    sources: Buf[&Mapping]
+    add: Buf[u8]
+    root: Option[&Node]
+
+    /** Every version, oldest first; `history[now]` is `root`. */
+    history: Buf[Option[&Node]]
+    now: usize
+
+    /** Which version is the one on disk, if any still is. */
+    saved: Option[usize]
+
+    seed: u64
+
+    /** How many bytes have been read to count newlines, which is what says a file was opened without
+     * being read.
+     */
+    scanned: u64
+
+    /** The number of bytes. */
+    size(self) -> u64 = bytes_of(self.root)
+
+    /** Whether the text differs from the version last saved. */
+    modified(self) -> bool = self.saved match
+        Some(v) -> v != self.now
+        None -> true
+
+    /** The length of the tree's longest path from the root, which is what every operation costs. */
+    depth(self) -> u64 = height(self.root)
+
+    /** Whether every newline has been counted, so `line_count` is free. */
+    lines_known(self) -> bool = sub_of(self.root) >= 0
+
+    /** The number of lines: one more than the number of newlines, so an empty text has one line and a
+     * text ending in a newline has an empty last line. The first call on a freshly opened file counts
+     * the whole of it.
+     */
+    line_count(*self) -> u64 = u64(self.counted(self.root)) + 1
+
+    private random(*self) -> u64
+        var x = self.seed
+
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        self.seed = x
+        x
+
+    private piece(self, src: usize, start: u64, len: u64) -> []const u8
+        val all: []const u8 = if src == 0 then self.add.view() else self.sources[src - 1].bytes()
+
+        all[usize(start)..<usize(start + len)]
+
+    private newlines(*self, bytes: []const u8) -> i64
+        var n = 0
+
+        self.scanned += u64(bytes.len)
+        for b in bytes do if b == u8('\n') then n += 1
+        n
+
+    private piece_lines(*self, x: &Node) -> i64
+        if x.lines < 0 then x.lines = self.newlines(self.piece(x.src, x.start, x.len))
+        x.lines
+
+    /** The subtree's newline count, counting whatever under it has not been counted yet. */
+    private counted(*self, n: Option[&Node]) -> i64 = n match
+        None -> 0
+        Some(x) ->
+            if x.sub < 0 then x.sub = self.counted(x.left) + self.piece_lines(x) + self.counted(x.right)
+            x.sub
+
+    /** A balanced tree of `runs[lo..<hi]` of source `src`. A node's priority is its depth's, higher
+     * nearer the root, with random low bits, so the shape is balanced and still heap-ordered.
+     */
+    private build(*self, src: usize, runs: []const Run, lo: usize, hi: usize, depth: u64) -> Option[&Node]
+        if lo >= hi then return None
+
+        val mid = lo + (hi - lo) / 2
+        val r = runs[mid]
+        val left = self.build(src, runs, lo, mid, depth + 1)
+        val right = self.build(src, runs, mid + 1, hi, depth + 1)
+
+        Some(node(((64 - depth) << 56) | (self.random() >> 8), src, r.start, r.len, r.lines, left, right))
+
+    /** `x`'s piece cut `k` bytes in, as two loose nodes. Where `x`'s count is known the halves' are
+     * too, by counting the shorter one.
+     */
+    private halves(*self, x: &Node, k: u64) -> (&Node, &Node)
+        var first: i64 = -1
+        var second: i64 = -1
+
+        if x.lines >= 0
+            if k <= x.len - k
+                first = self.newlines(self.piece(x.src, x.start, k))
+                second = x.lines - first
+            else
+                second = self.newlines(self.piece(x.src, x.start + k, x.len - k))
+                first = x.lines - second
+
+        (node(self.random(), x.src, x.start, k, first, None, None),
+         node(self.random(), x.src, x.start + k, x.len - k, second, None, None))
+    end halves
+
+    /** `n` as the trees of its first `at` bytes and of the rest. */
+    private split(*self, n: Option[&Node], at: u64) -> (Option[&Node], Option[&Node])
+        if n is Some(x)
+            val before = bytes_of(x.left)
+
+            if at <= before
+                val (a, b) = self.split(x.left, at)
+                return (a, Some(with(x, b, x.right)))
+
+            if at >= before + x.len
+                val (a, b) = self.split(x.right, at - before - x.len)
+                return (Some(with(x, x.left, a)), b)
+
+            val (front, back) = self.halves(x, at - before)
+            return (join(x.left, Some(front)), join(Some(back), x.right))
+
+        (None, None)
+    end split
+
+    /** Makes `root` the current version, discarding anything undone. */
+    private commit(*self, root: Option[&Node])
+        self.root = root
+        self.now += 1
+        self.history.truncate(self.now)
+        self.history.push(root)
+
+        if self.saved is Some(v)
+            if v >= self.now then self.saved = None
+
+    /** Inserts `bytes` before byte `at`. */
+    insert(*self, at: u64, bytes: []const u8)
+        assert(at <= self.size(), "insert past the end")
+        if bytes.len == 0 then return
+
+        val start = u64(self.add.len())
+
+        self.add.extend(bytes)
+
+        val (front, back) = self.split(self.root, at)
+        val added = node(self.random(), 0, start, u64(bytes.len), self.newlines(bytes), None, None)
+
+        self.commit(join(join(front, Some(added)), back))
+
+    /** Removes the `len` bytes from `at`. */
+    delete(*self, at: u64, len: u64)
+        assert(at + len <= self.size(), "delete past the end")
+        if len == 0 then return
+
+        val (front, rest) = self.split(self.root, at)
+        val (_, back) = self.split(rest, len)
+
+        self.commit(join(front, back))
+
+    /** Goes back one version; false where there is none. */
+    undo(*self) -> bool
+        if self.now == 0 then return false
+
+        self.now -= 1
+        self.root = self.history[self.now]
+        true
+
+    /** Goes forward one undone version; false where there is none. */
+    redo(*self) -> bool
+        if self.now + 1 >= self.history.len() then return false
+
+        self.now += 1
+        self.root = self.history[self.now]
+        true
+
+    /** The bytes from `at` to the end of the piece holding them -- the unit a reader walks the text
+     * in, one O(log n) step per piece. `at` is before the end.
+     */
+    chunk_at(self, at: u64) -> []const u8
+        var n = self.root
+        var off = at
+
+        loop
+            val x = n.unwrap()
+            val before = bytes_of(x.left)
+
+            if off < before
+                n = x.left
+            elif off < before + x.len
+                return self.piece(x.src, x.start + off - before, x.len - (off - before))
+            else
+                off -= before + x.len
+                n = x.right
+    end chunk_at
+
+    /** The byte at `at`, which is before the end. */
+    byte_at(self, at: u64) -> u8 = self.chunk_at(at)[0]
+
+    /** A copy of the bytes from `from` up to `to`. */
+    bytes(self, from: u64, to: u64) -> Buf[u8]
+        var out: Buf[u8] = buf()
+        var off = from
+
+        while off < to
+            val c = self.chunk_at(off)
+            val n = min(u64(c.len), to - off)
+
+            out.extend(c[..<usize(n)])
+            off += n
+
+        out
+
+    /** Where line `line` starts, counting lines from 0; the end of the text for a line past the last. */
+    line_start(*self, line: u64) -> u64
+        if line == 0 then return 0
+
+        self.seek(self.root, i64(line), 0) match
+            Some(at) -> at
+            None -> self.size()
+
+    /** Where in `n`, whose first byte is at `base`, the byte after its `want`th newline is; `None`
+     * where `n` has fewer, and then `n`'s count is known.
+     *
+     * **A subtree whose count is unknown is searched rather than counted**: the left one first, so a
+     * line near the top of a file is found having counted only the pieces before it. A search that
+     * fails has counted the whole subtree on the way, which is what the count it leaves behind costs.
+     */
+    private seek(*self, n: Option[&Node], want: i64, base: u64) -> Option[u64]
+        if n is Some(x)
+            if x.sub >= 0 && want > x.sub then return None
+            if self.seek(x.left, want, base) is Some(at) then return Some(at)
+
+            val left = sub_of(x.left)
+            val here = self.piece_lines(x)
+            val start = base + bytes_of(x.left)
+
+            if want - left <= here
+                return Some(start + nth_newline(self.piece(x.src, x.start, x.len), want - left) + 1)
+
+            val found = self.seek(x.right, want - left - here, start + x.len)
+
+            if found.is_none() then x.sub = left + here + sub_of(x.right)
+            return found
+
+        None
+    end seek
+
+    /** Where the text of line `line` ends: before its `\n`, and before a `\r` in front of that. */
+    line_end(*self, line: u64) -> u64
+        val start = self.line_start(line)
+        val next = self.line_start(line + 1)
+
+        if next == start || self.byte_at(next - 1) != u8('\n') then return next
+        if next - 1 > start && self.byte_at(next - 2) == u8('\r') then return next - 2
+        next - 1
+
+    /** The line `at` is on: the number of newlines before it. */
+    line_of(*self, at: u64) -> u64
+        var n = self.root
+        var off = at
+        var lines: i64 = 0
+
+        while n is Some(x)
+            val before = bytes_of(x.left)
+
+            if off < before
+                n = x.left
+            else
+                lines += self.counted(x.left)
+                off -= before
+
+                if off < x.len
+                    return u64(lines + self.newlines(self.piece(x.src, x.start, off)))
+
+                lines += self.piece_lines(x)
+                off -= x.len
+                n = x.right
+
+        u64(lines)
+    end line_of
+
+    /** `at`, moved back to the first byte of the character it is inside. */
+    char_start(self, at: u64) -> u64
+        var off = at
+
+        while off > 0 && off < self.size() && is_continuation(self.byte_at(off)) do off -= 1
+        off
+
+    /** The line and column of `at`, the column counted in characters. An offset inside a character is
+     * that character's, and one between a CRLF's two bytes is the end of the line.
+     */
+    position(*self, at: u64) -> (u64, u64)
+        val line = self.line_of(at)
+        val start = self.line_start(line)
+        val to = min(self.char_start(at), self.line_end(line))
+        var chars: u64 = 0
+        var off = start
+
+        while off < to
+            val c = self.chunk_at(off)
+            val n = min(u64(c.len), to - off)
+
+            for b in c[..<usize(n)] do if !is_continuation(b) then chars += 1
+            off += n
+
+        (line, chars)
+    end position
+
+    /** The offset of column `col` on line `line`, the column counted in characters; the end of the
+     * line's text for a column past it.
+     */
+    offset_at(*self, line: u64, col: u64) -> u64
+        val stop = self.line_end(line)
+        var off = self.line_start(line)
+        var left = col
+
+        while off < stop
+            val c = self.chunk_at(off)
+            val n = min(u64(c.len), stop - off)
+
+            for i in 0..<usize(n)
+                if !is_continuation(c[i])
+                    if left == 0 then return off + u64(i)
+                    left -= 1
+
+            off += n
+
+        stop
+    end offset_at
+
+    /** Writes every piece of `n` to `f` in order, describing each as a run of the file being written
+     * and folding a run into the one before while the two fit in a block.
+     */
+    private write_pieces(*self, n: Option[&Node], f: *File, runs: *Buf[Run], at: *u64)
+        if n is Some(x)
+            self.write_pieces(x.left, f, runs, at)
+            f.write(self.piece(x.src, x.start, x.len))
+
+            val last = runs.len()
+
+            if last > 0 && runs[last - 1].len + x.len <= self.block
+                val r = runs[last - 1]
+                val lines = if r.lines < 0 || x.lines < 0 then -1 else r.lines + x.lines
+
+                runs.set(last - 1, Run(r.start, r.len + x.len, lines))
+            else
+                runs.push(Run(*at, x.len, x.lines))
+
+            *at += x.len
+            self.write_pieces(x.right, f, runs, at)
+    end write_pieces
+
+    /** Writes the text to `path`, describing it as runs of the file written. */
+    private write_file(*self, path: string, runs: *Buf[Run]) -> Result[unit, IoError]
+        var f = create(path)?
+        var at: u64 = 0
+
+        self.write_pieces(self.root, &f, runs, &at)
+        f.sync()?
+        f.close()
+    end write_file
+
+    /** Saves to `path` and makes it the document's path.
+     *
+     * The text is written to a pending file beside `path`, synced, given the permissions of the file
+     * it replaces, and renamed over it, so `path` holds the old text or the new and never part of
+     * either. On any failure the pending file is removed and `path` is as it was.
+     *
+     * The saved file is then mapped and becomes the current version's source, its pieces the old
+     * pieces' boundaries with their newline counts carried over, so a save never recounts. Older
+     * versions still read the sources they were made from, which stay mapped.
+     */
+    save_as(*self, path: string) -> Result[unit, IoError]
+        val pending = pending_name(path)
+        var runs: Buf[Run] = buf()
+
+        if self.write_file(pending, &runs) is Err(e)
+            remove_file(pending).unwrap_or(())
+            return Err(e)
+
+        if metadata(path) is Ok(old)
+            set_permissions(pending, old.permissions()).unwrap_or(())
+
+        publish_file(pending, path)?
+
+        val m = map_file(path)?
+
+        self.sources.push(m)
+
+        val root = self.build(self.sources.len(), runs.view(), 0, runs.len(), 0)
+
+        self.root = root
+        self.history.set(self.now, root)
+        self.saved = Some(self.now)
+        self.path = path
+        Ok(())
+    end save_as
+
+    /** Saves to the document's own path. */
+    save(*self) -> Result[unit, IoError] = self.save_as(self.path)
+end Text
+
+/** An empty document that will be saved to `path`, mapping files in pieces of `block` bytes. */
+empty(path: string, block: u64 = block_bytes) -> Text
+    var history: Buf[Option[&Node]] = buf()
+
+    history.push(None)
+    Text(path, block, buf(), buf(), None, history, 0, Some(0), 0x9E3779B97F4A7C15, 0)
+
+/** The file at `path`, mapped and not read: its pieces are `block` bytes each and none is counted.
+ * The default is the one to use; a smaller one is how a test puts piece boundaries where it can see
+ * them.
+ */
+open(path: string, block: u64 = block_bytes) -> Result[Text, IoError]
+    val m = map_file(path)?
+    var t = empty(path, block)
+    var runs: Buf[Run] = buf()
+    var at: u64 = 0
+
+    while at < m.size
+        val len = min(block, m.size - at)
+
+        runs.push(Run(at, len, -1))
+        at += len
+
+    t.sources.push(m)
+    t.root = t.build(1, runs.view(), 0, runs.len(), 0)
+    t.history.set(0, t.root)
+    Ok(t)
+end open

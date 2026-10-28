@@ -1,0 +1,394 @@
+@tests
+
+// The text core, checked against a plain string that every edit is also made to: the bytes, the
+// lines, the columns, undo and redo, and a save, over files small enough to see every piece boundary
+// in and one large enough that reading it whole would show.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, NotFound, PermissionDenied, IsADirectory, make_temp_dir, remove_dir_all, write_text, read_text, read_bytes, metadata, set_permissions, create}
+import sysl.math.min
+import sysl.rand.{Rng, rng}
+import sysl.text.from_utf8
+
+/** A fresh directory holding `text` as `name`, and the file's path. */
+private fixture(text: string, name: string = "f.txt") -> (string, string)
+    val dir = make_temp_dir("te-test").unwrap()
+    val file = s"$dir/$name"
+
+    write_text(file, text).unwrap()
+    (dir, file)
+
+private all(t: Text) -> string = from_utf8(t.bytes(0, t.size()).view()).unwrap()
+
+private newlines_in(s: string) -> u64
+    var n: u64 = 0
+
+    for b in s.bytes do if b == u8('\n') then n += 1
+    n
+
+/** `text` with its pieces `block` bytes long, the file left in a directory the caller removes. */
+private opened(text: string, block: u64) -> (string, Text)
+    val (dir, file) = fixture(text)
+
+    (dir, open(file, block).unwrap())
+
+@test("an insert at the start, the middle and the end lands where it was asked")
+txt_insert_positions()
+    val (dir, t0) = opened("hello world", 4)
+    var t = t0
+
+    t.insert(0, ">".bytes)
+    t.insert(6, ",".bytes)
+    t.insert(t.size(), "!".bytes)
+    assert_eq(all(t), ">hello, world!")
+    remove_dir_all(dir).unwrap()
+
+@test("a delete at the start, the middle and the end removes exactly its bytes")
+txt_delete_positions()
+    val (dir, t0) = opened("0123456789abcdef", 4)
+    var t = t0
+
+    t.delete(0, 2)
+    assert_eq(all(t), "23456789abcdef")
+    t.delete(4, 3)
+    assert_eq(all(t), "23459abcdef")
+    t.delete(t.size() - 2, 2)
+    assert_eq(all(t), "23459abcd")
+    remove_dir_all(dir).unwrap()
+
+@test("a delete across several pieces of the file and of the add buffer joins what is left")
+txt_delete_across_pieces()
+    val (dir, t0) = opened("aaaabbbbccccddddeeee", 4)
+    var t = t0
+
+    t.insert(6, "XY".bytes)
+    t.insert(13, "Z".bytes)
+    assert_eq(all(t), "aaaabbXYbbcccZcddddeeee")
+    t.delete(3, 15)
+    assert_eq(all(t), "aaadeeee")
+    t.delete(0, t.size())
+    assert_eq(all(t), "")
+    assert_eq(t.size(), 0)
+    assert_eq(t.line_count(), 1)
+    remove_dir_all(dir).unwrap()
+
+@test("an insert exactly on a piece boundary splits nothing and lands between the two")
+txt_insert_on_boundary()
+    val (dir, t0) = opened("aaaabbbb", 4)
+    var t = t0
+
+    t.insert(4, "|".bytes)
+    t.insert(4, "<".bytes)
+    t.insert(6, ">".bytes)
+    assert_eq(all(t), "aaaa<|>bbbb")
+    remove_dir_all(dir).unwrap()
+
+@test("an empty file has one empty line, and takes an insert")
+txt_empty_file()
+    val (dir, t0) = opened("", 4)
+    var t = t0
+
+    assert_eq(t.size(), 0)
+    assert_eq(t.line_count(), 1)
+    assert_eq(t.line_start(0), 0)
+    assert_eq(t.line_end(0), 0)
+    assert_eq(t.line_start(5), 0)
+    assert_eq(t.position(0), (0, 0))
+    assert_eq(t.offset_at(0, 3), 0)
+    t.insert(0, "x\n".bytes)
+    assert_eq(t.line_count(), 2)
+    assert_eq(t.line_start(1), 2)
+    assert(t.undo())
+    assert_eq(t.size(), 0)
+    remove_dir_all(dir).unwrap()
+
+@test("a document that was never a file is empty and modified once edited")
+txt_new_document()
+    var t = empty("nowhere")
+
+    assert(!t.modified())
+    t.insert(0, "a".bytes)
+    assert(t.modified())
+    assert(t.undo())
+    assert(!t.modified())
+
+@test("a file with no newline at the end has its last line ending at the end")
+txt_no_trailing_newline()
+    val (dir, t0) = opened("one\ntwo", 3)
+    var t = t0
+
+    assert_eq(t.line_count(), 2)
+    assert_eq(t.line_start(1), 4)
+    assert_eq(t.line_end(1), 7)
+    assert_eq(t.line_end(0), 3)
+    assert_eq(t.line_start(2), 7)
+    assert_eq(t.position(7), (1, 3))
+    remove_dir_all(dir).unwrap()
+
+@test("a file ending in a newline has an empty last line after it")
+txt_trailing_newline()
+    val (dir, t0) = opened("one\ntwo\n", 3)
+    var t = t0
+
+    assert_eq(t.line_count(), 3)
+    assert_eq(t.line_start(2), 8)
+    assert_eq(t.line_end(1), 7)
+    assert_eq(t.line_end(2), 8)
+    assert_eq(t.position(8), (2, 0))
+    remove_dir_all(dir).unwrap()
+
+@test("CRLF is one line break, and the CR is not part of the line's text")
+txt_crlf()
+    val (dir, t0) = opened("ab\r\ncd\r\n\r\nlone\rcr", 3)
+    var t = t0
+
+    assert_eq(t.line_count(), 4)
+    assert_eq(t.line_start(1), 4)
+    assert_eq(t.line_end(0), 2)
+    assert_eq(t.line_end(1), 6)
+    assert_eq(t.line_start(2), 8)
+    assert_eq(t.line_end(2), 8)
+    assert_eq(t.line_end(3), 17)
+    assert_eq(t.offset_at(0, 9), 2)
+    assert_eq(t.offset_at(3, 5), 15)
+    assert_eq(t.position(2), (0, 2))
+    assert_eq(t.position(3), (0, 2))
+    remove_dir_all(dir).unwrap()
+
+@test("a CRLF split across two pieces is still one break, and a CR inserted before a LF joins it")
+txt_crlf_across_pieces()
+    val (dir, t0) = opened("ab\r\ncd", 3)
+    var t = t0
+
+    assert_eq(t.line_end(0), 2)
+    t.delete(2, 1)
+    assert_eq(t.line_end(0), 2)
+    t.insert(2, "\r".bytes)
+    assert_eq(t.line_end(0), 2)
+    assert_eq(t.line_count(), 2)
+    remove_dir_all(dir).unwrap()
+
+@test("a column counts characters, and no line or column query lands inside one")
+txt_utf8_columns()
+    // é is two bytes, 日本語 three each, 😀 four; pieces of 2 bytes cut every one of them.
+    val (dir, t0) = opened("héllo\n日本語\n😀x", 2)
+    var t = t0
+
+    assert_eq(t.position(1), (0, 1))
+    assert_eq(t.position(2), (0, 1))
+    assert_eq(t.position(3), (0, 2))
+    assert_eq(t.position(3), (0, 2))
+    assert_eq(t.line_start(1), 7)
+    assert_eq(t.position(9), (1, 0))
+    assert_eq(t.position(10), (1, 1))
+    assert_eq(t.position(15), (1, 2))
+    assert_eq(t.offset_at(1, 1), 10)
+    assert_eq(t.offset_at(1, 2), 13)
+    assert_eq(t.offset_at(1, 3), 16)
+    assert_eq(t.offset_at(1, 9), 16)
+    assert_eq(t.offset_at(2, 1), 21)
+    assert_eq(t.position(19), (2, 0))
+    assert_eq(t.position(21), (2, 1))
+    assert_eq(t.char_start(20), 17)
+    assert_eq(t.char_start(17), 17)
+    assert_eq(t.char_start(t.size()), t.size())
+    remove_dir_all(dir).unwrap()
+
+@test("undo and redo walk the versions, and an edit after an undo drops the ones undone")
+txt_undo_redo()
+    val (dir, t0) = opened("base", 2)
+    var t = t0
+
+    assert(!t.undo())
+    t.insert(4, "1".bytes)
+    t.insert(5, "2".bytes)
+    t.delete(0, 2)
+    assert_eq(all(t), "se12")
+    assert(t.undo())
+    assert_eq(all(t), "base12")
+    assert(t.undo())
+    assert(t.undo())
+    assert_eq(all(t), "base")
+    assert(!t.undo())
+    assert(!t.modified())
+    assert(t.redo())
+    assert_eq(all(t), "base1")
+    assert(t.modified())
+    t.insert(0, "!".bytes)
+    assert(!t.redo())
+    assert_eq(all(t), "!base1")
+    assert(t.undo())
+    assert(t.undo())
+    assert_eq(all(t), "base")
+    remove_dir_all(dir).unwrap()
+
+/** Random text over an alphabet with both line breaks in it, ASCII so the model can cut it anywhere. */
+private random_text(r: *Rng, n: u64) -> string
+    val alphabet = "abc \n\r\n"
+    var out: Buf[u8] = buf()
+
+    for _ in 0..<n do out.push(alphabet.bytes[usize(r.below(u64(alphabet.bytes.len)))])
+    from_utf8(out.view()).unwrap()
+
+private check_lines(t: *Text, model: string, r: *Rng)
+    assert_eq(t.line_count(), newlines_in(model) + 1)
+
+    val at = r.below(t.size() + 1)
+    val line = newlines_in(model[..<usize(at)])
+
+    assert_eq(t.line_of(at), line)
+
+    val (l, c) = t.position(at)
+
+    assert_eq(l, line)
+    assert_eq(t.offset_at(l, c), min(at, t.line_end(l)))
+
+    val want = r.below(t.line_count() + 1)
+    var start: u64 = 0
+    var seen: u64 = 0
+
+    for i in 0..<model.bytes.len
+        if seen == want then break
+        if model.bytes[i] == u8('\n')
+            seen += 1
+            start = u64(i) + 1
+
+    if seen < want then start = u64(model.bytes.len)
+    assert_eq(t.line_start(want), start)
+
+@test("thousands of random edits, undos and redos agree with a string model at every step")
+txt_random_against_model()
+    var r = rng(0x7E7E, 1)
+    val (dir, t0) = opened(random_text(&r, 300), 16)
+    var t = t0
+    var versions: Buf[string] = buf()
+    var now: usize = 0
+
+    versions.push(read_text(t.path).unwrap())
+
+    for step in 0..<4000
+        val model = versions[now]
+        val choice = r.below(10)
+
+        if choice < 4
+            val at = r.below(t.size() + 1)
+            val add = random_text(&r, 1 + r.below(30))
+
+            t.insert(at, add.bytes)
+            now += 1
+            versions.truncate(now)
+            versions.push(model[..<usize(at)] + add + model[usize(at)..])
+        elif choice < 7 && t.size() > 0
+            val at = r.below(t.size())
+            val len = r.below(min(t.size() - at, 20) + 1)
+
+            t.delete(at, len)
+            if len > 0
+                now += 1
+                versions.truncate(now)
+                versions.push(model[..<usize(at)] + model[usize(at + len)..])
+        elif choice < 9
+            assert_eq(t.undo(), now > 0)
+            if now > 0 then now -= 1
+        else
+            assert_eq(t.redo(), now + 1 < versions.len())
+            if now + 1 < versions.len() then now += 1
+
+        assert_eq(all(t), versions[now], s"step $step")
+        check_lines(&t, versions[now], &r)
+
+        if step % 500 == 499
+            t.save().unwrap()
+            assert_eq(read_text(t.path).unwrap(), versions[now])
+
+    remove_dir_all(dir).unwrap()
+end txt_random_against_model
+
+@test("a hundred thousand one-byte inserts at random places keep the tree shallow")
+txt_balanced()
+    var r = rng(42, 7)
+    val (dir, t0) = opened(random_text(&r, 50_000), 64)
+    var t = t0
+
+    for _ in 0..<100_000 do t.insert(r.below(t.size() + 1), "x".bytes)
+
+    assert_eq(t.size(), 150_000)
+    assert(t.depth() < 64, s"depth ${t.depth()}")
+    remove_dir_all(dir).unwrap()
+
+@test("a save writes exactly the text, keeps the file's permissions, and undo still reads the old file")
+txt_save_round_trip()
+    val (dir, t0) = opened("first line\nsecond line\n", 5)
+    var t = t0
+
+    set_permissions(t.path, 0o640).unwrap()
+    t.insert(0, "zeroth\n".bytes)
+    t.delete(18, 12)
+    assert_eq(t.line_count(), 3)
+
+    val counted = t.scanned
+
+    t.save().unwrap()
+    assert(!t.modified())
+    assert_eq(read_text(t.path).unwrap(), "zeroth\nfirst line\n")
+    assert_eq(metadata(t.path).unwrap().permissions(), 0o640)
+    assert_eq(all(t), "zeroth\nfirst line\n")
+    assert(t.lines_known())
+    assert_eq(t.line_count(), 3)
+    assert_eq(t.scanned, counted)
+
+    // The file the first versions were read from has been renamed over; they still read it.
+    assert(t.undo())
+    assert(t.modified())
+    assert(t.undo())
+    assert_eq(all(t), "first line\nsecond line\n")
+    assert(t.redo())
+    assert(t.redo())
+    assert(!t.modified())
+
+    t.insert(t.size(), "é\r\n".bytes)
+    t.save().unwrap()
+    assert_eq(read_bytes(t.path).unwrap().len, 22)
+    assert_eq(read_text(t.path).unwrap(), "zeroth\nfirst line\né\r\n")
+    remove_dir_all(dir).unwrap()
+
+@test("save_as writes a new file, leaves the old one alone, and becomes the document's path")
+txt_save_as()
+    val (dir, t0) = opened("abc", 2)
+    var t = t0
+    val old = t.path
+
+    t.insert(3, "def".bytes)
+    t.save_as(s"$dir/g.txt").unwrap()
+    assert_eq(t.path, s"$dir/g.txt")
+    assert_eq(read_text(old).unwrap(), "abc")
+    assert_eq(read_text(t.path).unwrap(), "abcdef")
+    remove_dir_all(dir).unwrap()
+
+@test("a missing file, a directory and an unreadable file are refused with what is wrong")
+txt_open_errors()
+    val (dir, file) = fixture("secret")
+
+    assert_eq(open(s"$dir/missing").err(), Some(NotFound))
+    assert_eq(open(dir).err(), Some(IsADirectory))
+    set_permissions(file, 0).unwrap()
+    assert_eq(open(file).err(), Some(PermissionDenied))
+    set_permissions(file, 0o600).unwrap()
+    assert(open(file).is_ok())
+    remove_dir_all(dir).unwrap()
+
+@test("a save into a directory that cannot be written is refused and changes nothing")
+txt_save_read_only_dir()
+    val (dir, t0) = opened("keep", 2)
+    var t = t0
+
+    t.insert(0, "x".bytes)
+    set_permissions(dir, 0o555).unwrap()
+    assert_eq(t.save().err(), Some(PermissionDenied))
+    assert(t.modified())
+    assert_eq(all(t), "xkeep")
+    set_permissions(dir, 0o755).unwrap()
+    assert_eq(read_text(t.path).unwrap(), "keep")
+    t.save().unwrap()
+    assert_eq(read_text(t.path).unwrap(), "xkeep")
+    remove_dir_all(dir).unwrap()

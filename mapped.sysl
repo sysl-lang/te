@@ -1,0 +1,86 @@
+@include("<sys/mman.h>")
+@include("<fcntl.h>")
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, NotFound, PermissionDenied, NotPermitted, IsADirectory, NotADirectory, TooManyOpenFiles, Other, metadata}
+import sysl.slices.as_ptr
+
+// A file's bytes, mapped read-only into the address space and never copied.
+//
+// Mapping is what makes opening a file of any size instant: the kernel hands back an address range and
+// reads a page only when something touches it, so the cost of opening is a few system calls whatever
+// the size. The mapping is private and read-only, so nothing written through it could reach the file,
+// and nothing here writes through it.
+//
+// **The descriptor is closed as soon as the mapping exists**; a mapping outlives the descriptor it was
+// made from. **The mapping outlives the file's name too**: a save renames a new file over the old one,
+// and the old inode stays alive for as long as it is mapped, which is what lets an undo after a save
+// still read the text it is going back to.
+
+c const
+    PROT_READ: int   = "PROT_READ"
+    MAP_PRIVATE: int = "MAP_PRIVATE"
+    O_RDONLY: int    = "O_RDONLY"
+    SEEK_END: int    = "SEEK_END"
+
+private extern "open" c_open(path: *u8, flags: int) -> int
+private extern "close" c_close(fd: int) -> int
+private extern "lseek" c_lseek(fd: int, offset: i64, whence: int) -> i64
+private extern "mmap" c_mmap(addr: *u8, len: usize, prot: int, flags: int, fd: int, offset: i64) -> *u8
+private extern "munmap" c_munmap(addr: *u8, len: usize) -> int
+
+#if bsd
+private extern "__error" errno_location() -> *i32
+#elif android
+private extern "__errno" errno_location() -> *i32
+#else
+private extern "__errno_location" errno_location() -> *i32
+#endif
+
+/** The bytes of one file as they were when it was mapped. An empty file maps nothing and answers an
+ * empty view.
+ */
+struct Mapping
+    private at: *u8
+    size: u64
+
+    /** The whole file. */
+    bytes(self) -> []const u8 = if self.size == 0 then [] else self.at[0..<usize(self.size)]
+
+impl Drop for Mapping
+    drop(self)
+        if self.size > 0 then c_munmap(self.at, usize(self.size))
+
+/** `errno` read straight after the call that set it, as the `IoError` it names. */
+private failure() -> IoError = errno_location()[0] match
+    1  -> NotPermitted
+    2  -> NotFound
+    13 -> PermissionDenied
+    20 -> NotADirectory
+    21 -> IsADirectory
+    24 -> TooManyOpenFiles
+    code -> Other(code)
+
+/** Maps the file at `path`. A directory is refused as `IsADirectory` before anything is opened, since
+ * `open(2)` would accept one and only the mapping would then fail, with a less useful code.
+ */
+map_file(path: string) -> Result[&Mapping, IoError]
+    if metadata(path)?.is_dir() then return Err(IsADirectory)
+
+    var name: Buf[u8] = buf()
+    name.extend(path.bytes)
+    name.push(0)
+
+    val fd = c_open(as_ptr(name.view()), O_RDONLY)
+    if fd < 0 then return Err(failure())
+    defer c_close(fd)
+
+    val size = c_lseek(fd, 0, SEEK_END)
+    if size < 0 then return Err(failure())
+    if size == 0 then return Ok(Mapping(null, 0))
+
+    val at = c_mmap(null, usize(size), PROT_READ, MAP_PRIVATE, fd, 0)
+    if usize(at) == usize::Max then return Err(failure())
+
+    Ok(Mapping(at, u64(size)))
+end map_file

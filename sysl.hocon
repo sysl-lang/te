@@ -1,0 +1,29 @@
+// A terminal text editor: no modes, the keys every other program uses, and files of any size.
+//
+//     sysl build .
+//     ./te notes.txt
+//
+// The text is a piece table over the file mapped read-only, held as a balanced persistent tree, so
+// opening a file of many gigabytes is instant, every edit and every line query is O(log n), and undo
+// is going back to an earlier root. `docs/design.md` has the design and the order it is being built in.
+
+package {
+  name    = "te"
+  version = "0.1.0"
+  sysl    = "0.7.5"
+}
+
+optimization = "2"
+
+// **`os` and `heap`** for the file and the tree; **`posix`** because the file is mapped with `mmap`
+// and the screen is a terminal in raw mode.
+requires {
+  os    = true
+  posix = true
+  heap  = true
+}
+
+// `termbox2` draws the screen and reads the keys and the mouse.
+dependencies {
+  termbox2 { git = "github.com/sysl-lang/termbox2", version = "0.2.1" }
+}

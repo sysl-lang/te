@@ -1,0 +1,75 @@
+@tests
+
+// A file too large to read on opening without it showing: 200 MB of 100-byte lines. Opening it must
+// read none of it, and a jump to a line near the end must land on the right byte.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, create}
+import sysl.time.monotonic
+
+const line_bytes: u64 = 100
+const lines_per_chunk: u64 = 10_000
+const chunks: u64 = 200
+
+/** Line `n` of the fixture: its number, zero-padded, and filler to 99 bytes, then a newline. */
+private fixture_line(n: u64, out: *Buf[u8])
+    val number = s"$n".bytes
+
+    for _ in number.len..<12 do out.push(u8('0'))
+    out.extend(number)
+    for _ in 12..<99 do out.push(u8('.'))
+    out.push(u8('\n'))
+
+private millis_since(start: long) -> long = (monotonic().us - start) / 1000
+
+@test("a 200 MB file opens without being read, and a jump to its last lines lands on the right byte")
+big_open_and_goto()
+    val dir = make_temp_dir("te-big").unwrap()
+    val file = s"$dir/big.txt"
+    var f = create(file).unwrap()
+
+    for c in 0..<chunks
+        var chunk: Buf[u8] = buf()
+
+        for i in 0..<lines_per_chunk do fixture_line(c * lines_per_chunk + i, &chunk)
+        f.write(chunk.view())
+
+    f.close().unwrap()
+
+    val total = chunks * lines_per_chunk
+    val opening = monotonic().us
+    var t = open(file).unwrap()
+    val opened = millis_since(opening)
+
+    assert_eq(t.size(), total * line_bytes)
+    assert_eq(t.scanned, 0, "opening read the file")
+    assert(!t.lines_known())
+    assert(opened < 100, s"opening took $opened ms")
+
+    // The top of the file is reachable without counting the rest of it.
+    assert_eq(t.line_start(3), 3 * line_bytes)
+    assert(t.scanned <= 1 << 20, s"line 3 counted ${t.scanned} bytes")
+
+    val jumping = monotonic().us
+    val near_end = total - 5
+    val at = t.line_start(near_end)
+    val jumped = millis_since(jumping)
+
+    assert_eq(at, near_end * line_bytes)
+    assert_eq(t.offset_at(near_end, 0), at)
+    assert_eq(t.position(at + 7), (near_end, 7))
+    assert_eq(t.line_count(), total + 1)
+
+    // Every newline has now been counted once, and an edit near the end costs no recount.
+    val counted = t.scanned
+
+    t.insert(at, "inserted\n".bytes)
+    assert_eq(t.line_count(), total + 2)
+    assert_eq(t.line_start(near_end + 1), at + 9)
+    assert(t.scanned - counted <= 2 << 20, s"the edit recounted ${t.scanned - counted} bytes")
+    assert(t.undo())
+    assert_eq(t.line_count(), total + 1)
+
+    assert(jumped < 2000, s"counting 200 MB to line $near_end took $jumped ms")
+    remove_dir_all(dir).unwrap()
+end big_open_and_goto
