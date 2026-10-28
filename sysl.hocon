@@ -10,7 +10,7 @@
 package {
   name    = "te"
   version = "0.1.0"
-  sysl    = "0.7.5"
+  sysl    = "0.7.8"
 }
 
 optimization = "2"

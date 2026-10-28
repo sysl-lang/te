@@ -1,11 +1,11 @@
 import sysl.buf.{Buf, buf}
-import sysl.fs.{IoError, File, create, metadata, set_permissions, pending_name, publish_file, remove_file}
+import sysl.fs.{IoError, File, Mapped, map_file, create, metadata, set_permissions, pending_name, publish_file, remove_file}
 import sysl.math.{min, max}
 
 // The text being edited: a piece table held as a balanced persistent tree.
 //
 // **Nothing is ever copied out of the file.** The bytes a document holds live in its *sources*: the
-// files it has been mapped from (`Mapping`), and one *add buffer* every inserted byte is appended to
+// files it has been mapped from (`Mapped`), and one *add buffer* every inserted byte is appended to
 // and never removed from. The document itself is a sequence of *pieces*, each a run of one source's
 // bytes, in reading order. An insert appends to the add buffer and splices one piece in; a delete
 // leaves the bytes where they are and splices pieces out.
@@ -130,7 +130,7 @@ struct Text
     /** The size of the pieces a file is mapped as (`block_bytes`). */
     block: u64
 
-    sources: Buf[&Mapping]
+    sources: Buf[&Mapped]
     add: Buf[u8]
     root: Option[&Node]
 
@@ -210,6 +210,7 @@ struct Text
         self.seed = x
         x
 
+    @views(self)
     private piece(self, src: usize, start: u64, len: u64) -> []const u8
         val all: []const u8 = if src == 0 then self.add.view() else self.sources[src - 1].bytes()
 
@@ -228,7 +229,7 @@ struct Text
     private piece_lines(*self, x: &Node) -> i64
         if x.lines < 0
             x.lines = self.newlines(self.piece(x.src, x.start, x.len))
-            if x.src > 0 then self.sources[x.src - 1].release(x.start, x.len)
+            if x.src > 0 then release(self.sources[x.src - 1], x.start, x.len)
 
         x.lines
 
@@ -378,6 +379,7 @@ struct Text
     /** The bytes from `at` to the end of the piece holding them -- the unit a reader walks the text
      * in, one O(log n) step per piece. `at` is before the end.
      */
+    @views(self)
     chunk_at(self, at: u64) -> []const u8
         var n = self.root
         var off = at
@@ -398,6 +400,7 @@ struct Text
     /** The bytes from the start of the piece holding byte `at - 1` up to `at`: what a reader going
      * backwards walks. `at` is after the start.
      */
+    @views(self)
     chunk_before(self, at: u64) -> []const u8
         var n = self.root
         var off = at - 1
@@ -652,7 +655,7 @@ struct Text
      */
     reload(*self) -> Result[unit, IoError]
         val m = map_file(self.path)?
-        val size = m.size
+        val size = u64(m.len())
 
         self.sources.push(m)
         self.commit(self.mapped(self.sources.len(), size))
@@ -687,7 +690,7 @@ empty(path: string, block: u64 = block_bytes) -> Text
  */
 open(path: string, block: u64 = block_bytes) -> Result[Text, IoError]
     val m = map_file(path)?
-    val size = m.size
+    val size = u64(m.len())
     var t = empty(path, block)
 
     t.sources.push(m)
