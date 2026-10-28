@@ -89,9 +89,8 @@ time), double-click to select a word, wheel to scroll. **The clipboard is the sy
 ssh**, by OSC 52 (`ESC ] 52 ; c ; <base64> BEL`; the terminal sets the local clipboard). A copy over
 256 KiB is not sent — terminals refuse or cut one much longer — and the status bar says it stays in
 te's own clipboard. Paste is meant to arrive as **bracketed paste**, so a pasted block is one insert
-and one undo step and is never auto-indented; the editor takes it (`Input.Paste`), but the terminal
-side waits on the termbox2 package, which reads `ESC [ 200 ~` as the Escape key and four characters
-and offers no way to see the raw input. Line numbers are shown softly (dim, not part of the text);
+and one undo step and is never auto-indented; te turns it on at start-up and termbox2's `Paste` event
+becomes `Input.Paste`. Line numbers are shown softly (dim, not part of the text);
 colours are true-colour with a fallback to 256. Syntax highlighting comes last, and highlights only
 the visible rows.
 
@@ -132,8 +131,9 @@ counting), the viewport, and what each key does, and renders into a `Grid` of ce
 (`screen.sysl`); `main.sysl` turns termbox's events into `Input` and copies the grid to termbox. So
 the tests drive the editor with keys and read the grid, with no terminal. Display widths are
 termbox's own `wcwidth`, the table it lays the cells out with, so the cursor and the cells cannot
-disagree. Combining marks take no column and move with the character before them, but are not drawn
-yet: the termbox2 package is built without `TB_OPT_EGC`, so a cell cannot hold a cluster.
+disagree. Combining marks take no column and move with the character before them; a grid cell holds its
+base character and the marks, and they are drawn together with `set_cluster`. A sequence joined by
+a zero-width joiner is still laid out character by character, as `wcwidth` counts it.
 
 ## Milestones
 
@@ -141,6 +141,6 @@ yet: the termbox2 package is built without `TB_OPT_EGC`, so a cell cannot hold a
    queries, save. Tested against a string model over thousands of random edits, and on a 200 MB file.
 2. **View** — termbox2 screen, cursor movement, typing and deleting, save, quit prompt.
 3. **Editing UI** — selection, clipboard (OSC 52), find / replace with progress and cancel, undo
-   grouping, goto line, mouse. Bracketed paste on the terminal side waits on termbox2.
+   grouping, goto line, mouse. Bracketed paste and combining marks are done.
 4. **Huge files** — line totals counted in the background, external-change detection.
 5. **Highlighting** — per-language, visible rows only.

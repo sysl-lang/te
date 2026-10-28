@@ -1148,6 +1148,7 @@ struct Editor
         var h: usize = 0
         var off = start
         var col: u64 = 0
+        var last = -1
 
         while off < end && col < stop
             val (c, len) = self.char_at(off)
@@ -1168,7 +1169,12 @@ struct Editor
             elif span > 0 && col >= self.left && col + span <= stop
                 val ch = if wcwidth(u32(c)) < 0 then 0xFFFD else u32(c)
 
-                g.glyph(int(gutter + col - self.left), y, ch, int(span), fg, bg)
+                last = int(gutter + col - self.left)
+                g.glyph(last, y, ch, int(span), fg, bg)
+            elif span == 0 && last >= 0
+                g.extend(last, y, u32(c))
+            else
+                last = -1
 
             col += span
             off += len

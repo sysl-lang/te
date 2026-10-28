@@ -9,13 +9,17 @@ import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_lossy
 import sh.sysl.termbox2.{DEFAULT, wcwidth}
 
-/** One cell: a codepoint and its two attributes. A codepoint of 0 is the second column of the wide
- * character to its left, which termbox draws as part of that character.
+/** One cell: a codepoint, the combining marks drawn on it, and its two attributes. A codepoint of 0 is
+ * the second column of the wide character to its left, which termbox draws as part of that character.
  */
 struct Cell
     ch: u32
+    marks: string
     fg: u64
     bg: u64
+
+    /** The base character and its marks: what the cell shows. */
+    cluster(self) -> string = string(char(self.ch)) + self.marks
 
 /** A screen's worth of cells, and where the cursor is, if it is shown. */
 struct Grid
@@ -29,35 +33,48 @@ struct Grid
         self.w = w
         self.h = h
         self.cells.clear()
-        for _ in 0..<w * h do self.cells.push(Cell(u32(' '), DEFAULT, DEFAULT))
+        for _ in 0..<w * h do self.cells.push(Cell(u32(' '), "", DEFAULT, DEFAULT))
         self.cursor = None
 
     at(self, x: int, y: int) -> Cell = self.cells[y * self.w + x]
 
     /** Sets one cell; a position off the grid is ignored. */
     put(*self, x: int, y: int, ch: u32, fg: u64, bg: u64)
-        if x >= 0 && x < self.w && y >= 0 && y < self.h then self.cells.set(usize(y * self.w + x), Cell(ch, fg, bg))
+        if x >= 0 && x < self.w && y >= 0 && y < self.h then self.cells.set(usize(y * self.w + x), Cell(ch, "", fg, bg))
 
     /** A character `width` columns wide at `x`: a wide one also takes the cell after it. */
     glyph(*self, x: int, y: int, ch: u32, width: int, fg: u64, bg: u64)
         self.put(x, y, ch, fg, bg)
         for i in 1..<width do self.put(x + i, y, 0, fg, bg)
 
-    /** `s` from `x`, and the column after it. A combining mark has no cell of its own and is not
-     * drawn: termbox is built without grapheme-cluster cells, so it cannot put one on its base.
+    /** Adds a combining mark to the cell at `x`, to be drawn on its character. */
+    extend(*self, x: int, y: int, ch: u32)
+        if x >= 0 && x < self.w && y >= 0 && y < self.h
+            val i = usize(y * self.w + x)
+            val cell = self.cells[i]
+
+            if cell.ch != 0 then self.cells.set(i, Cell(cell.ch, cell.marks + string(char(ch)), cell.fg, cell.bg))
+
+    /** `s` from `x`, and the column after it. A combining mark has no column of its own and joins the
+     * character before it.
      */
     write(*self, x: int, y: int, s: string, fg: u64, bg: u64) -> int
         var col = x
+        var last = -1
 
         for c in s.chars
             val w = wcwidth(u32(c))
 
             if w < 0
                 self.put(col, y, 0xFFFD, fg, bg)
+                last = col
                 col += 1
             elif w > 0
                 self.glyph(col, y, u32(c), w, fg, bg)
+                last = col
                 col += w
+            elif last >= 0
+                self.extend(last, y, u32(c))
 
         col
     end write
@@ -67,9 +84,9 @@ struct Grid
         var out: Buf[u8] = buf()
 
         for x in 0..<self.w
-            val ch = self.at(x, y).ch
+            val cell = self.at(x, y)
 
-            if ch != 0 then out.extend(string(char(ch)).bytes)
+            if cell.ch != 0 then out.extend(cell.cluster().bytes)
 
         var end = out.len()
 
