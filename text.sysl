@@ -66,6 +66,9 @@ private bytes_of(n: Option[&Node]) -> u64 = n match
     Some(x) -> x.bytes
     None -> 0
 
+/** The size of a slice `Text.slice` took. */
+slice_size(piece: Option[&Node]) -> u64 = bytes_of(piece)
+
 private sub_of(n: Option[&Node]) -> i64 = n match
     Some(x) -> x.sub
     None -> 0
@@ -266,6 +269,41 @@ struct Text
         val (_, back) = self.split(rest, len)
 
         self.commit(join(front, back))
+
+    /** The pieces holding `from..<to`, shared with the current version rather than copied, so taking a
+     * slice of any size costs two splits and reads nothing. A slice stays valid across every later
+     * edit and save, because the sources it points into only ever grow.
+     */
+    slice(*self, from: u64, to: u64) -> Option[&Node]
+        assert(from <= to && to <= self.size(), "slice past the end")
+
+        val (_, rest) = self.split(self.root, from)
+
+        self.split(rest, to - from).0
+
+    /** Inserts a slice taken by `slice` before byte `at`: one version, whatever its size. */
+    insert_slice(*self, at: u64, piece: Option[&Node])
+        assert(at <= self.size(), "insert past the end")
+        if bytes_of(piece) == 0 then return
+
+        val (front, back) = self.split(self.root, at)
+
+        self.commit(join(join(front, piece), back))
+
+    /** The newlines in a slice, counted once and kept like any other count. */
+    slice_lines(*self, piece: Option[&Node]) -> u64 = u64(self.counted(piece))
+
+    /** Makes the versions after `since` one version, so a single undo goes back to `since`. A save of
+     * the current version is kept; a save of one of the versions folded away is forgotten, since
+     * that text is no longer one undo can reach.
+     */
+    squash(*self, since: usize)
+        if self.now <= since + 1 then return
+
+        if self.saved is Some(v) && v > since then self.saved = if v == self.now then Some(since + 1) else None
+        self.history.set(since + 1, self.root)
+        self.history.truncate(since + 2)
+        self.now = since + 1
 
     /** Goes back one version; false where there is none. */
     undo(*self) -> bool

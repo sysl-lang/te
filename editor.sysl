@@ -13,25 +13,54 @@
 // down move keeps the screen column it started from (`goal`) until a move along the line.
 //
 // Each edit is one version of the text, and the cursor before and after it is kept beside the
-// version, so an undo puts the cursor back where the edit was made.
+// version, so an undo puts the cursor back where the edit was made. **One undo step is one thing the
+// reader did**, which is sometimes several versions folded into one (`group`): a replaced selection
+// (a delete and an insert), a paste, a replace-all, and a run of typing. A run of typed characters is
+// one step until the cursor is moved or anything else is done, a second passes without a key, or a
+// letter or digit is typed after a space or punctuation -- so each word, with the spaces after it,
+// is one step. A run of Backspace and Delete is one step by the same rules, less the word rule.
+//
+// **The selection is the text between the cursor and an anchor**, both byte offsets. Only the cursor
+// keeps its line; the anchor's line is asked for when the cursor is put there, so selecting all of
+// a file of many gigabytes reads none of it. **The clipboard is a slice of the text** -- the pieces
+// that held the copied bytes, shared rather than copied -- so a copy, a cut and a paste of any size
+// cost O(log n) and read nothing, and the system clipboard is sent the text, by OSC 52, up to
+// `osc52_limit`.
+//
+// **A search is a job the screen stays live through.** It reads the text a window at a time from
+// the cursor (`work`), wrapping at the end, and the terminal's loop runs a window whenever no key is
+// waiting, so Esc stops it and the status bar shows how far it has got.
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, NotFound}
-import sysl.math.min
+import sysl.math.{min, max}
 import sysl.text.{chars_of, from_utf8_lossy, parse_ulong, split}
-import sh.sysl.termbox2.{Key, wcwidth, DEFAULT, REVERSE, DIM, BOLD}
+import sh.sysl.termbox2.{Key, wcwidth, DEFAULT, REVERSE, DIM, BOLD, BLACK, YELLOW}
 
 /** How many columns a tab reaches to a multiple of. */
 const tab_width: u64 = 4
+
+/** How long, in milliseconds, a pause in typing may be and the typing still be one undo step. */
+const streak_pause: long = 1000
+
+/** How soon, in milliseconds, a second click in the same place is a double click. */
+const double_click: long = 400
+
+/** How much of the text a search reads in one step between keys. */
+const search_step: u64 = 4 << 20
 
 /** What the editor is told: the terminal's input, already named. */
 enum Input
     /** A character typed. */
     Type(c: char)
-    /** A key that is not a character, with whether Ctrl was held. */
-    Press(key: Key, ctrl: bool)
+    /** A key that is not a character, with whether Ctrl and Shift were held. */
+    Press(key: Key, ctrl: bool, shift: bool)
     /** A click at a screen position. */
     Click(x: int, y: int)
+    /** The mouse moved to a screen position with the button held. */
+    Drag(x: int, y: int)
+    /** Text the terminal says was pasted, all at once. */
+    Paste(text: string)
     /** The wheel, in lines: positive scrolls down. */
     Wheel(lines: int)
     /** The terminal's new size. */
@@ -46,9 +75,51 @@ enum Prompt
     GoingTo
     /** A name to save an unnamed buffer as. */
     Naming
+    /** Text to find, searched for as it is typed. */
+    Finding
+    /** Text to replace. */
+    Replacing
+    /** What to replace it with. */
+    ReplacingWith
+    /** Whether to replace the match selected. */
+    Confirming
 
 /** A cursor: its offset and the line it is on. */
 type Spot = (u64, u64)
+
+/** What the last edit was part of, which the next edit may join. */
+enum Streak
+    Quiet
+    Typing
+    Erasing
+
+/** What a search does with a match. */
+enum Goal
+    /** Selects it. */
+    Show
+    /** Selects it and asks whether to replace it. */
+    Ask
+    /** Replaces it, and every one after it. */
+    ReplaceAll
+
+/** A search in progress. Matches start in `pos..<limit` going forward, or `limit..<pos` going back;
+ * once that is looked through, the rest of the text is, from the other end back to `origin`.
+ */
+struct Hunt
+    goal: Goal
+    back: bool
+    pos: u64
+    limit: u64
+    origin: u64
+    wrapped: bool
+
+    /** How many bytes have been looked through, for the progress shown. */
+    done: u64
+
+    /** A replace-all's replacements so far, the version before the first, and the cursor it keeps. */
+    count: u64
+    since: usize
+    keep: u64
 
 struct Editor
     text: Text
@@ -83,6 +154,48 @@ struct Editor
     /** The cursor before and after the edit that made each version, by version. */
     before: Buf[Spot]
     after: Buf[Spot]
+
+    /** The other end of the selection from the cursor, if there is a selection. */
+    anchor: Option[u64]
+
+    /** What Ctrl+C or Ctrl+X took: a slice of the text. */
+    clip: Option[&Node]
+
+    /** Bytes for the terminal rather than the screen: OSC 52, for the system clipboard. */
+    outbox: Buf[u8]
+
+    /** The time, in milliseconds from any fixed start, of the input being handled. Whoever feeds the
+     * editor its input sets it.
+     */
+    clock: long
+
+    /** The run the last edit was part of, the one before the input being handled, and the last
+     * character and time in it.
+     */
+    streak: Streak
+    last_streak: Streak
+    streak_char: char
+    streak_clock: long
+
+    /** When and where the last click was. */
+    click_clock: long
+    click_at: (int, int)
+
+    /** The text searched for, its replacement, and whether case matters. */
+    query: Buf[u8]
+    replacement: Buf[u8]
+    match_case: bool
+
+    /** Whether the query's matches on screen are shown. */
+    lit: bool
+
+    /** Where the cursor was when the find prompt opened: a search as the query is typed starts here. */
+    origin: Spot
+
+    hunt: Option[Hunt]
+
+    /** How many bytes searches have read. */
+    searched: u64
 
     // ---- layout ------------------------------------------------------------------------------
 
@@ -283,8 +396,68 @@ struct Editor
         self.before.push(before)
         self.after.push((self.at, self.line))
         self.goal = None
+        self.anchor = None
+
+    /** Makes the versions after `since` one undo step, which puts the cursor back where it was
+     * before the first of them.
+     */
+    group(*self, since: usize)
+        if self.text.now <= since + 1 then return
+
+        val after = self.after[self.text.now]
+
+        self.text.squash(since)
+        self.before.truncate(since + 2)
+        self.after.truncate(since + 2)
+        self.after.set(since + 1, after)
+
+    /** Folds the edit just made, which made version `since + 1`, into the one before it when both
+     * belong to one run of `kind` (the rules are at the top of this file). `c` is the character
+     * typed.
+     */
+    run_on(*self, kind: Streak, c: char, since: usize)
+        val word_starts = kind == Typing && is_word(c) && !is_word(self.streak_char)
+        val saved_between = self.text.saved == Some(since)
+
+        if self.last_streak == kind && since > 0 && self.clock - self.streak_clock <= streak_pause && !word_starts && !saved_between
+            self.group(since - 1)
+
+        self.streak = kind
+        self.streak_char = c
+        self.streak_clock = self.clock
+    end run_on
+
+    /** A typed character, over the selection if there is one. */
+    type_char(*self, c: char)
+        val since = self.text.now
+
+        if self.erase()
+            self.insert(string(c).bytes)
+            self.group(since)
+        else
+            self.insert(string(c).bytes)
+            self.run_on(Typing, c, since)
+
+    /** Backspace or Delete: the selection if there is one, else the character on that side. */
+    erase_key(*self, back: bool)
+        if self.erase() then return
+
+        val since = self.text.now
+
+        if back then self.backspace() else self.delete()
+        self.run_on(Erasing, ' ', since)
+
+    /** Enter, over the selection if there is one. */
+    enter(*self)
+        val since = self.text.now
+
+        self.erase()
+        self.newline()
+        self.group(since)
 
     insert(*self, bytes: []const u8)
+        if bytes.len == 0 then return
+
         val before = (self.at, self.line)
 
         self.text.insert(self.at, bytes)
@@ -330,16 +503,328 @@ struct Editor
             self.remove(end, self.text.line_start(self.line + 1), self.line)
 
     undo(*self)
+        self.anchor = None
         if self.text.undo() then
             val (at, line) = self.before[self.text.now + 1]
 
             self.place(at, line)
 
     redo(*self)
+        self.anchor = None
         if self.text.redo() then
             val (at, line) = self.after[self.text.now]
 
             self.place(at, line)
+
+    // ---- the selection and the clipboard -----------------------------------------------------
+
+    /** The selected bytes, `from..<to`, if any are. */
+    selection(self) -> Option[(u64, u64)]
+        if self.anchor is Some(a) && a != self.at then return Some((min(a, self.at), max(a, self.at)))
+
+        None
+
+    /** The line `at` is on, which is the cursor's own when it is the cursor. */
+    line_at(*self, at: u64) -> u64 = if at == self.at then self.line else self.text.line_of(at)
+
+    /** Before a move: with Shift it starts the selection where the cursor is, or keeps the one there
+     * is; without, it drops it.
+     */
+    extend(*self, shift: bool)
+        if !shift
+            self.anchor = None
+        elif self.anchor is None
+            self.anchor = Some(self.at)
+
+    /** Left or Right with a selection and no Shift: the cursor goes to that end of it. */
+    collapse(*self, start: bool) -> bool
+        if self.selection() is Some((from, to))
+            val at = if start then from else to
+
+            self.place(at, self.line_at(at))
+            self.anchor = None
+            return true
+
+        false
+
+    /** Deletes the selection; false where there is none. */
+    erase(*self) -> bool
+        if self.selection() is Some((from, to))
+            self.remove(from, to, self.line_at(from))
+            return true
+
+        false
+
+    /** Everything: from the end to the start when the line total is not known yet, so that nothing
+     * is read to find the last line.
+     */
+    select_all(*self)
+        if self.text.lines_known()
+            self.anchor = Some(0)
+            self.place(self.text.size(), self.last_line())
+        else
+            self.anchor = Some(self.text.size())
+            self.place(0, 0)
+
+    /** The word at the cursor, or the one character there when it is not in a word. */
+    select_word(*self)
+        val start = self.text.line_start(self.line)
+        val end = self.text.line_end(self.line)
+
+        if self.at >= end then return
+
+        var from = self.at
+        var to = self.cluster_end(self.at, end)
+
+        if is_word(self.char_at(self.at).0)
+            while from > start && is_word(self.char_at(self.text.char_start(from - 1)).0) do from = self.text.char_start(from - 1)
+            while to < end && is_word(self.char_at(to).0) do to += self.char_at(to).1
+
+        self.anchor = Some(from)
+        self.place(to, self.line)
+    end select_word
+
+    /** Puts the selection on the clipboard, and on the system's when it is small enough to send;
+     * `did` is the word the status bar says it with. False when nothing is selected.
+     */
+    copy(*self, did: string) -> bool
+        if self.selection() is Some((from, to))
+            val n = to - from
+
+            self.clip = self.text.slice(from, to)
+            if n <= osc52_limit
+                self.outbox.extend(osc52(self.text.bytes(from, to).view()).view())
+                self.message = s"$did ${amount(n)}"
+            else
+                self.message = s"$did ${amount(n)}, too much for the system clipboard (${amount(osc52_limit)} at most): paste it in te"
+            return true
+
+        self.message = "Nothing is selected"
+        false
+    end copy
+
+    cut(*self)
+        if self.copy("Cut") then self.erase()
+
+    /** The clipboard, over the selection if there is one, as one undo step. */
+    paste(*self)
+        if self.clip is None
+            self.message = "Nothing has been copied"
+            return
+
+        val since = self.text.now
+        val piece = self.clip
+
+        self.erase()
+
+        val before = (self.at, self.line)
+
+        self.text.insert_slice(self.at, piece)
+        self.at += slice_size(piece)
+        self.line += self.text.slice_lines(piece)
+        self.edited(before)
+        self.group(since)
+    end paste
+
+    /** Text the terminal pasted: inserted as it is, never indented, as one undo step. A terminal sends
+     * a pasted line break as a carriage return, so a lone one is a line feed again.
+     */
+    paste_text(*self, text: string)
+        val b = text.bytes
+        var bytes: Buf[u8] = buf()
+
+        for i in 0..<b.len
+            if b[i] == u8('\r') && (i + 1 == b.len || b[i + 1] != u8('\n')) then bytes.push(u8('\n')) else bytes.push(b[i])
+
+        if bytes.len() == 0 then return
+
+        val since = self.text.now
+
+        self.erase()
+        self.insert(bytes.view())
+        self.group(since)
+    end paste_text
+
+    // ---- searching ---------------------------------------------------------------------------
+
+    /** Whether a search is running. */
+    busy(self) -> bool = self.hunt is Some(_)
+
+    /** Opens the find or the replace prompt. */
+    find(*self, replacing: bool)
+        self.prompt = if replacing then Replacing else Finding
+        self.entry.clear()
+        self.origin = (self.at, self.line)
+
+    /** The query typed so far changed: search again from where the prompt opened. */
+    requery(*self)
+        self.query.clear()
+        self.query.extend(self.entry.view())
+        self.hunt = None
+        self.anchor = None
+        self.place(self.origin.0, self.origin.1)
+        if self.query.len() > 0 then self.start(Show, false, self.at) else self.lit = false
+
+    /** F3 and Shift+F3: the next match after the cursor, or the one before the selection. */
+    next(*self, back: bool)
+        if self.query.len() == 0 then return self.find(false)
+
+        val from = if back && self.selection() is Some((f, _)) then f else self.at
+
+        self.start(Show, back, from)
+
+    /** Starts a search from `from`. */
+    start(*self, goal: Goal, back: bool, from: u64)
+        val size = self.text.size()
+        val limit = if back then 0 else size
+
+        self.lit = true
+        self.hunt = Some(Hunt(goal, back, from, limit, from, goal == ReplaceAll, 0, 0, self.text.now, self.at))
+
+    /** Looks through up to `budget` more bytes for the search in progress. */
+    work(*self, budget: u64)
+        if self.hunt is Some(h) then self.step(h, budget)
+
+    /** Runs the search in progress to its end. */
+    finish(*self)
+        while self.busy() do self.work(search_step)
+
+    private step(*self, hunt: Hunt, budget: u64)
+        var h = hunt
+        val n = u64(self.query.len())
+        val needle = prepared(self.query.view(), self.match_case)
+        val size = self.text.size()
+
+        if h.back
+            val lo = if h.pos > h.limit + budget then h.pos - budget else h.limit
+            val window = self.text.bytes(lo, min(h.pos + n - 1, size))
+
+            self.searched += u64(window.len())
+            if last_match(window.view(), needle.view(), self.match_case, usize(h.pos - lo)) is Some(i) then return self.found(h, lo + u64(i))
+            h.done += h.pos - lo
+            h.pos = lo
+        else
+            val hi = min(h.pos + budget, h.limit)
+            val window = self.text.bytes(h.pos, min(hi + n - 1, size))
+
+            self.searched += u64(window.len())
+            if h.goal == ReplaceAll then return self.replace_window(h, window.view(), needle.view(), hi)
+            if first_match(window.view(), needle.view(), self.match_case, usize(hi - h.pos)) is Some(i) then return self.found(h, h.pos + u64(i))
+            h.done += hi - h.pos
+            h.pos = hi
+
+        if h.pos != h.limit then
+            self.hunt = Some(h)
+        elif h.wrapped then
+            self.hunt = None
+            self.not_found(h)
+        else
+            h.wrapped = true
+            h.pos = if h.back then size else 0
+            h.limit = h.origin
+            self.hunt = Some(h)
+    end step
+
+    /** A match at `at`: selected, with the cursor after it. */
+    private found(*self, h: Hunt, at: u64)
+        val end = at + u64(self.query.len())
+
+        self.hunt = None
+        self.anchor = Some(at)
+        self.place(end, self.text.line_of(end))
+        if h.wrapped then self.message = if h.back then "Search wrapped to the end" else "Search wrapped to the start"
+        if h.goal == Ask then self.prompt = Confirming
+        self.follow()
+
+    private not_found(*self, h: Hunt)
+        self.message = s"Not found: ${from_utf8_lossy(self.query.view())}"
+        if h.goal == Ask then self.prompt = Idle
+
+    /** Replace-all over one window: every match starting before `hi`, replaced from the last back so
+     * that the offsets of the ones before stay true, as part of the one undo step the replace-all is.
+     */
+    private replace_window(*self, hunt: Hunt, window: []const u8, needle: []const u8, hi: u64)
+        var h = hunt
+        val n = u64(needle.len)
+        val r = u64(self.replacement.len())
+        var starts: Buf[u64] = buf()
+        var i: usize = 0
+        val below = usize(hi - h.pos)
+
+        while i < below && first_match(window[i..], needle, self.match_case, below - i) is Some(k)
+            starts.push(h.pos + u64(i + k))
+            i += k + needle.len
+
+        // A match runs at most `n - 1` bytes past `hi`, so the next window starts after the last one.
+        var next = hi
+
+        if starts.len() > 0 then next = max(hi, starts[starts.len() - 1] + n)
+
+        var k = starts.len()
+
+        while k > 0
+            k -= 1
+
+            val at = starts[k]
+
+            self.text.delete(at, n)
+            self.text.insert(at, self.replacement.view())
+            if h.keep >= at + n then
+                h.keep = h.keep + r - n
+            elif h.keep > at
+                h.keep = at + r
+
+        self.text.squash(h.since)
+
+        val grew = u64(starts.len()) * r
+        val shrank = u64(starts.len()) * n
+
+        h.count += u64(starts.len())
+        h.done += next - h.pos
+        h.pos = next + grew - shrank
+        h.limit = h.limit + grew - shrank
+        if h.pos >= h.limit
+            self.hunt = None
+            self.replaced(h, false)
+        else
+            self.hunt = Some(h)
+    end replace_window
+
+    /** A replace-all is over, or stopped: the cursor where it was in the text, and one undo step. */
+    private replaced(*self, h: Hunt, stopped: bool)
+        val before = (self.at, self.line)
+
+        self.prompt = Idle
+        if stopped then
+            self.message = s"Replaced ${h.count}, then stopped"
+        elif h.count == 0 then
+            self.message = s"Not found: ${from_utf8_lossy(self.query.view())}"
+        else
+            self.message = s"Replaced ${h.count}"
+        if h.count == 0 then return
+
+        self.at = h.keep
+        self.line = self.text.line_of(h.keep)
+        self.edited(before)
+        self.follow()
+
+    /** Esc during a search. */
+    cancel(*self)
+        if self.hunt is Some(h)
+            self.hunt = None
+            if h.goal == ReplaceAll then return self.replaced(h, true)
+
+            self.message = "Search stopped"
+            if self.prompt == Finding then self.place(self.origin.0, self.origin.1)
+
+    /** Y in the replace prompt: this match replaced, as one undo step, and on to the next. */
+    replace_one(*self)
+        val since = self.text.now
+
+        self.erase()
+        self.insert(self.replacement.view())
+        self.group(since)
+        self.start(Ask, false, self.at)
 
     // ---- saving and quitting -----------------------------------------------------------------
 
@@ -373,33 +858,71 @@ struct Editor
             return self.follow()
 
         self.message = ""
-        if self.prompt != Idle then return self.answer(input)
+        self.last_streak = self.streak
+        self.streak = Quiet
 
-        input match
-            Type(c) -> self.insert(string(c).bytes)
-            Press(key, ctrl) -> self.press(key, ctrl)
-            Click(x, y) -> self.click(x, y)
-            Wheel(n) -> return self.scroll(n)
-            Resized(_, _) -> ()
+        // While a search runs, Esc stops it and the find prompt still takes keys; the rest waits.
+        if self.busy()
+            if input is Press(Esc, _, _) then return self.cancel()
+            if self.prompt != Finding && input is not Wheel(_) then return
+
+        if input is Wheel(n) then return self.scroll(n)
+
+        if self.prompt != Idle
+            self.answer(input)
+        else
+            input match
+                Type(c) -> self.type_char(c)
+                Press(key, ctrl, shift) -> self.press(key, ctrl, shift)
+                Click(x, y) -> self.click(x, y)
+                Drag(x, y) -> self.drag(x, y)
+                Paste(text) -> self.paste_text(text)
+                _ -> ()
 
         self.follow()
     end handle
 
-    press(*self, key: Key, ctrl: bool)
+    press(*self, key: Key, ctrl: bool, shift: bool)
         key match
-            Left -> if ctrl then self.word_left() else self.left_one()
-            Right -> if ctrl then self.word_right() else self.right_one()
-            Up -> self.vertical(-1)
-            Down -> self.vertical(1)
-            PageUp -> self.page(-1)
-            PageDown -> self.page(1)
-            Home -> if ctrl then self.place(0, 0) else self.home()
-            End -> if ctrl then self.place(self.text.size(), self.last_line()) else self.place(self.text.line_end(self.line), self.line)
-            Enter -> self.newline()
-            Tab -> self.insert("\t".bytes)
-            Space -> self.insert(" ".bytes)
-            Backspace | Backspace2 -> self.backspace()
-            Delete -> self.delete()
+            Left -> if shift || !self.collapse(true)
+                self.extend(shift)
+                if ctrl then self.word_left() else self.left_one()
+            Right -> if shift || !self.collapse(false)
+                self.extend(shift)
+                if ctrl then self.word_right() else self.right_one()
+            Up ->
+                self.extend(shift)
+                self.vertical(-1)
+            Down ->
+                self.extend(shift)
+                self.vertical(1)
+            PageUp ->
+                self.extend(shift)
+                self.page(-1)
+            PageDown ->
+                self.extend(shift)
+                self.page(1)
+            Home ->
+                self.extend(shift)
+                if ctrl then self.place(0, 0) else self.home()
+            End ->
+                self.extend(shift)
+                if ctrl then self.place(self.text.size(), self.last_line()) else self.place(self.text.line_end(self.line), self.line)
+            Enter -> self.enter()
+            Tab -> self.type_char('\t')
+            Space -> self.type_char(' ')
+            Backspace | Backspace2 -> self.erase_key(true)
+            Delete -> self.erase_key(false)
+            CtrlA -> self.select_all()
+            CtrlC -> self.copy("Copied")
+            CtrlX -> self.cut()
+            CtrlV -> self.paste()
+            CtrlF -> self.find(false)
+            CtrlR -> self.find(true)
+            F3 -> self.next(shift)
+            Esc ->
+                self.anchor = None
+                self.lit = false
             CtrlZ -> self.undo()
             CtrlY -> self.redo()
             CtrlS -> self.save()
@@ -408,6 +931,7 @@ struct Editor
                 self.prompt = GoingTo
                 self.entry.clear()
             _ -> ()
+    end press
 
     /** A key while the status bar is asking something. */
     answer(*self, input: Input)
@@ -420,15 +944,44 @@ struct Editor
                         if self.save() then self.done = true
                     elif c == 'n' || c == 'N'
                         self.done = true
-                Press(key, _) -> if key == Esc || key == CtrlC || key == CtrlQ then self.prompt = Idle
+                Press(key, _, _) -> if key == Esc || key == CtrlC || key == CtrlQ then self.prompt = Idle
                 _ -> ()
             return
 
+        if self.prompt == Confirming
+            input match
+                Type(c) ->
+                    if c == 'y' || c == 'Y'
+                        self.replace_one()
+                    elif c == 'n' || c == 'N'
+                        self.start(Ask, false, self.at)
+                    elif c == 'a' || c == 'A'
+                        self.anchor = None
+                        self.start(ReplaceAll, false, 0)
+                Press(key, _, _) -> key match
+                    Enter -> self.replace_one()
+                    Esc | CtrlC | CtrlQ -> self.prompt = Idle
+                    _ -> ()
+                _ -> ()
+            return
+
+        val finding = self.prompt == Finding
+
         input match
-            Type(c) -> self.entry.extend(string(c).bytes)
-            Press(key, _) -> key match
-                Space -> self.entry.push(u8(' '))
-                Backspace | Backspace2 -> pop_char(&self.entry)
+            Type(c) ->
+                self.entry.extend(string(c).bytes)
+                if finding then self.requery()
+            Press(key, _, shift) -> key match
+                Space ->
+                    self.entry.push(u8(' '))
+                    if finding then self.requery()
+                Backspace | Backspace2 ->
+                    pop_char(&self.entry)
+                    if finding then self.requery()
+                CtrlT -> if finding || self.prompt == Replacing
+                    self.match_case = !self.match_case
+                    if finding && self.entry.len() > 0 then self.requery()
+                F3 -> if finding then self.next(shift)
                 Enter -> self.submit()
                 Esc | CtrlC | CtrlQ ->
                     self.prompt = Idle
@@ -441,6 +994,29 @@ struct Editor
     submit(*self)
         val asked = self.prompt
         val entry = from_utf8_lossy(self.entry.view())
+
+        if asked == Finding then return self.next(false)
+
+        if asked == Replacing
+            if self.entry.len() > 0 then
+                self.query.clear()
+                self.query.extend(self.entry.view())
+            if self.query.len() == 0
+                self.prompt = Idle
+                self.message = "Nothing to find"
+            else
+                self.prompt = ReplacingWith
+                self.entry.clear()
+            return
+
+        if asked == ReplacingWith
+            self.replacement.clear()
+            self.replacement.extend(self.entry.view())
+            self.prompt = Idle
+
+            val from = if self.selection() is Some((f, _)) then f else self.at
+
+            return self.start(Ask, false, from)
 
         self.prompt = Idle
         if asked == GoingTo
@@ -465,10 +1041,31 @@ struct Editor
         else
             self.goto(line - 1, col - 1)
 
+    /** A click places the cursor and is where a drag selects from; a second one in the same place
+     * soon after selects the word there.
+     */
     click(*self, x: int, y: int)
         if y < 0 || u64(y) >= self.rows() then return
 
-        var line = self.top + u64(y)
+        val double = self.clock - self.click_clock <= double_click && self.click_at == (x, y)
+
+        self.click_clock = self.clock
+        self.click_at = (x, y)
+        self.point(x, y)
+        self.anchor = Some(self.at)
+        if double then self.select_word()
+
+    /** The mouse moved with the button held: the selection runs from where it was pressed. */
+    drag(*self, x: int, y: int)
+        if self.anchor is None then self.anchor = Some(self.at)
+        self.point(x, y)
+
+    /** The cursor at a screen position: a row past the text is its last line, and a row above or below
+     * the view is the line just beyond it, so a drag there scrolls a line at a time.
+     */
+    point(*self, x: int, y: int)
+        val rows = self.rows()
+        var line = if y < 0 then self.top - min(self.top, 1) elif u64(y) >= rows then self.top + rows else self.top + u64(y)
 
         if !self.has_line(line) then line = self.last_line()
 
@@ -527,7 +1124,7 @@ struct Editor
         if self.h > 1 then self.status(g, int(rows))
         if self.h > 2 then self.keys(g, int(rows) + 1)
 
-        if self.prompt == GoingTo || self.prompt == Naming then return
+        if self.typing_in_prompt() then return
 
         val (col, _) = self.column(self.line, self.at)
 
@@ -535,38 +1132,98 @@ struct Editor
             g.cursor = Some((int(gutter + col - self.left), int(self.line - self.top)))
     end render
 
+    /** Whether the reader is typing into the status bar, which then has the cursor. */
+    typing_in_prompt(self) -> bool =
+        self.prompt == GoingTo || self.prompt == Naming || self.prompt == Finding || self.prompt == Replacing || self.prompt == ReplacingWith
+
+    /** Line `n`, the part of it in view. The selection is drawn reversed, a selected line break as one
+     * reversed cell after the text, and the query's matches black on yellow.
+     */
     draw_line(*self, g: *Grid, n: u64, y: int, gutter: u64, width: u64)
         val end = self.text.line_end(n)
         val stop = self.left + width
-        var off = self.text.line_start(n)
+        val start = self.text.line_start(n)
+        val (from, to) = self.selection().unwrap_or((0, 0))
+        val hits = self.hits(n, start, end, stop)
+        var h: usize = 0
+        var off = start
         var col: u64 = 0
 
         while off < end && col < stop
             val (c, len) = self.char_at(off)
             val span = cells(c, col, self.tab)
 
-            if c != '\t' && span > 0 && col >= self.left && col + span <= stop
+            while h < hits.len() && hits[h].1 <= off do h += 1
+
+            val (fg, bg) = if off >= from && off < to then
+                (DEFAULT | REVERSE, DEFAULT)
+            elif h < hits.len() && hits[h].0 <= off then
+                (BLACK, YELLOW)
+            else
+                (DEFAULT, DEFAULT)
+
+            if c == '\t'
+                for i in 0..<span
+                    if col + i >= self.left && col + i < stop then g.put(int(gutter + col + i - self.left), y, u32(' '), fg, bg)
+            elif span > 0 && col >= self.left && col + span <= stop
                 val ch = if wcwidth(u32(c)) < 0 then 0xFFFD else u32(c)
 
-                g.glyph(int(gutter + col - self.left), y, ch, int(span), DEFAULT, DEFAULT)
+                g.glyph(int(gutter + col - self.left), y, ch, int(span), fg, bg)
 
             col += span
             off += len
+
+        if end >= from && end < to && col >= self.left && col < stop then g.put(int(gutter + col - self.left), y, u32(' '), DEFAULT | REVERSE, DEFAULT)
     end draw_line
+
+    /** Where the query matches in the part of line `n` that can be in view (to screen column
+     * `stop`), when matches are shown.
+     */
+    hits(*self, n: u64, start: u64, end: u64, stop: u64) -> Buf[(u64, u64)]
+        var out: Buf[(u64, u64)] = buf()
+
+        if !self.lit || self.query.len() == 0 then return out
+
+        val len = self.query.len()
+        val hay = self.text.bytes(start, min(end, self.at_column(n, stop) + 4 + u64(len)))
+        val needle = prepared(self.query.view(), self.match_case)
+        var i: usize = 0
+
+        while i < hay.len() && first_match(hay.view()[i..], needle.view(), self.match_case, hay.len() - i) is Some(k)
+            out.push((start + u64(i + k), start + u64(i + k + len)))
+            i += k + len
+
+        out
+    end hits
 
     /** The file, whether it is modified, and where the cursor is -- or the question being asked. */
     status(*self, g: *Grid, y: int)
         for x in 0..<self.w do g.put(x, y, u32(' '), DEFAULT | REVERSE, DEFAULT)
 
+        val entry = from_utf8_lossy(self.entry.view())
+        val case = if self.match_case then "match case" else "any case"
         val say = self.prompt match
             Quitting -> "Save changes before quitting?"
-            GoingTo -> s"Go to line: ${from_utf8_lossy(self.entry.view())}"
-            Naming -> s"Save as: ${from_utf8_lossy(self.entry.view())}"
+            GoingTo -> s"Go to line: $entry"
+            Naming -> s"Save as: $entry"
+            Finding -> s"Find ($case): $entry"
+            Replacing -> s"Replace ($case): $entry"
+            ReplacingWith -> s"Replace ${from_utf8_lossy(self.query.view())} with: $entry"
+            Confirming -> s"Replace this with ${from_utf8_lossy(self.replacement.view())}?"
             Idle -> if self.message.len > 0 then self.message else self.title()
 
         val end = g.write(1, y, say, DEFAULT | REVERSE | BOLD, DEFAULT)
 
-        if self.prompt == GoingTo || self.prompt == Naming
+        // What a search is doing, or what it found, beside the question the prompt is asking.
+        val note = if self.hunt is Some(h) then
+            s"Searching, ${percent(h.done, self.text.size())} (Esc stops)"
+        elif self.prompt != Idle then
+            self.message
+        else
+            ""
+        val noted = if note.len > 0 then g.write(end + 2, y, note, DEFAULT | REVERSE, DEFAULT) else end
+
+        if self.typing_in_prompt()
             g.cursor = Some((end, y))
             return
 
@@ -576,7 +1233,7 @@ struct Editor
 
         val room = int(place.len)
 
-        if end + 2 + room <= self.w then g.write(self.w - room, y, place, DEFAULT | REVERSE, DEFAULT)
+        if noted + 2 + room <= self.w then g.write(self.w - room, y, place, DEFAULT | REVERSE, DEFAULT)
     end status
 
     title(self) -> string
@@ -586,15 +1243,23 @@ struct Editor
 
     /** The keys that work now, the way nano shows them. */
     keys(*self, g: *Grid, y: int)
-        val shown: []const (string, string) = self.prompt match
-            Idle -> [("^S", "Save"), ("^Q", "Quit"), ("^G", "Go to line"), ("^Z", "Undo"), ("^Y", "Redo")]
+        val idle: []const (string, string) = [("^S", "Save"), ("^Q", "Quit"), ("^F", "Find"), ("^R", "Replace"),
+            ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^A", "All"), ("^G", "Go to line")]
+        val shown: []const (string, string) = if self.busy() then [("Esc", "Stop")] else self.prompt match
+            Idle -> idle
             Quitting -> [("Y", "Yes"), ("N", "No"), ("Esc", "Cancel")]
             GoingTo -> [("Enter", "Go"), ("Esc", "Cancel")]
             Naming -> [("Enter", "Save"), ("Esc", "Cancel")]
+            Finding -> [("Enter", "Next"), ("Shift+F3", "Previous"), ("^T", "Match case"), ("Esc", "Done")]
+            Replacing -> [("Enter", "Next"), ("^T", "Match case"), ("Esc", "Cancel")]
+            ReplacingWith -> [("Enter", "Start"), ("Esc", "Cancel")]
+            Confirming -> [("Y", "Replace"), ("N", "Skip"), ("A", "All"), ("Esc", "Stop")]
 
         var x = 0
 
+        // A key is shown whole or not at all, the most used first.
         for (key, label) in shown
+            if x + int(key.len + 1 + label.len) > self.w then break
             x = g.write(x, y, key, DEFAULT | REVERSE, DEFAULT)
             x = g.write(x + 1, y, label, DEFAULT, DEFAULT) + 2
     end keys
@@ -607,7 +1272,8 @@ editor(text: Text, w: int = 80, h: int = 24, tab: u64 = tab_width) -> Editor
 
     before.push((0, 0))
     after.push((0, 0))
-    Editor(text, 0, 0, None, 0, 0, w, h, tab, Idle, buf(), false, "", false, before, after)
+    Editor(text, 0, 0, None, 0, 0, w, h, tab, Idle, buf(), false, "", false, before, after, None, None, buf(), 0,
+        Quiet, Quiet, ' ', 0, -double_click - 1, (-1, -1), buf(), buf(), false, false, (0, 0), None, 0)
 
 /** The editor for `te <path>`: the file, a new file of that name where there is none, or an unnamed
  * buffer for an empty path. Any other failure to open it is the error.
@@ -643,6 +1309,17 @@ is_word(c: char) -> bool =
     c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || u32(c) >= 0x80
 
 is_blank(b: u8) -> bool = b == u8(' ') || b == u8('\t')
+
+/** A byte count the way the status bar says it. */
+amount(n: u64) -> string
+    if n == 1 then return "1 byte"
+    if n < 1 << 10 then return s"$n bytes"
+    if n < 1 << 20 then return s"${n >> 10} KiB"
+
+    s"${n >> 20} MiB"
+
+/** `part` of `whole`, as a percentage. */
+percent(part: u64, whole: u64) -> string = s"${if whole == 0 then 100 else min(part * 100 / whole, 100)}%"
 
 private first_char(b: []const u8) -> (char, u64)
     var cs = chars_of(b)

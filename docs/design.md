@@ -67,20 +67,56 @@ the way nano does, but as readable words rather than `^X`:
 |---|---|
 | Ctrl+S | save |
 | Ctrl+Q | quit; asks first when there are unsaved changes |
-| Ctrl+Z / Ctrl+Y | undo / redo (typing coalesces into one step per word or pause) |
-| Ctrl+F, F3 | find, find next |
-| Ctrl+H | replace |
+| Ctrl+Z / Ctrl+Y | undo / redo (typing is one step per word, see below) |
+| Ctrl+F; Enter or F3, Shift+F3 | find as you type; next, previous |
+| Ctrl+T (in the find or replace prompt) | case matters / any case |
+| Ctrl+R | replace: Y this one, N skip, A all |
 | Ctrl+G | go to line |
 | Ctrl+X / C / V | cut / copy / paste |
-| Shift+arrows | select |
+| Ctrl+A | select all |
+| Shift + any move | select |
 | Ctrl+arrows | move by word |
 | Home / End, PgUp / PgDn | line start / end, page up / down |
+| Esc | drop the selection and the highlighted matches; stop a search |
 
-The mouse works: click to place, drag to select, wheel to scroll. **The clipboard is the system's,
-even over ssh**, by OSC 52 (the terminal sets the local clipboard). Paste arrives as **bracketed
-paste**, so a pasted block is one insert and one undo step and is never auto-indented. Line numbers are
-shown softly (dim, not part of the text); colours are true-colour with a fallback to 256. Syntax
-highlighting comes last, and highlights only the visible rows.
+Replace is **Ctrl+R, not Ctrl+H**: a terminal sends Ctrl+H as the same byte as Backspace (0x08), and
+many send it for the Backspace key itself. The case toggle is **Ctrl+T, not Alt+C**: with the Escape
+key reported at once (termbox's `ESC` input mode), Alt+C arrives as Escape and then `c`, so it would
+close the prompt.
+
+The mouse works: click to place, drag to select (dragging past the top or bottom scrolls a line at a
+time), double-click to select a word, wheel to scroll. **The clipboard is the system's, even over
+ssh**, by OSC 52 (`ESC ] 52 ; c ; <base64> BEL`; the terminal sets the local clipboard). A copy over
+256 KiB is not sent — terminals refuse or cut one much longer — and the status bar says it stays in
+te's own clipboard. Paste is meant to arrive as **bracketed paste**, so a pasted block is one insert
+and one undo step and is never auto-indented; the editor takes it (`Input.Paste`), but the terminal
+side waits on the termbox2 package, which reads `ESC [ 200 ~` as the Escape key and four characters
+and offers no way to see the raw input. Line numbers are shown softly (dim, not part of the text);
+colours are true-colour with a fallback to 256. Syntax highlighting comes last, and highlights only
+the visible rows.
+
+**One undo step is one thing the reader did.** A run of typed characters is one step until the
+cursor is moved or anything else is done, more than a second passes between keys, or a letter or
+digit is typed after a space or punctuation — so each word, with the spaces after it, is one step,
+as in most editors. A run of Backspace and Delete is one step by the same rules, less the word rule.
+A save ends a run, so undo always reaches the saved text. A replaced selection (a delete and an
+insert), a paste and a replace-all are one step each. The core keeps one root per version; grouping
+folds the versions of a step into one (`Text.squash`), so a replace-all of a million matches holds
+one extra version, not a million.
+
+**The clipboard is a slice of the tree**, not a copy of the bytes: the pieces that held the selection,
+shared with the version they came from. The sources only grow, so a slice stays valid across every
+later edit and save, and a copy, cut or paste of any size costs O(log n) and reads nothing. Ctrl+A
+on a file whose line total is not known yet puts the cursor at the start and the other end of the
+selection at the end, so selecting, copying or deleting all of a 4 GB file reads none of it.
+
+**Search is a job, not a call.** It reads the text a window (4 MiB) at a time from the cursor,
+wrapping at the end, and the terminal loop runs a window whenever no key is waiting — so the screen
+stays live, the status bar shows how far it has got, Esc stops it, and typing into the find prompt
+starts it again from where the prompt opened. A key's own search gets one window before the screen is
+drawn, so a search of an ordinary file never shows as running. Matching ignores the case of the ASCII
+letters by default; every other byte matches only itself. Matches are highlighted on the visible rows
+only, each row searched as it is drawn.
 
 ## Rendering
 
@@ -104,7 +140,7 @@ yet: the termbox2 package is built without `TB_OPT_EGC`, so a cell cannot hold a
 1. **Core** — the piece tree over the mapped file and the add buffer, undo/redo, byte and line
    queries, save. Tested against a string model over thousands of random edits, and on a 200 MB file.
 2. **View** — termbox2 screen, cursor movement, typing and deleting, save, quit prompt.
-3. **Editing UI** — selection, clipboard (OSC 52), find / replace, undo grouping, goto line, mouse.
-4. **Huge files** — line totals counted in the background, progress and cancel on a long search,
-   external-change detection.
+3. **Editing UI** — selection, clipboard (OSC 52), find / replace with progress and cancel, undo
+   grouping, goto line, mouse. Bracketed paste on the terminal side waits on termbox2.
+4. **Huge files** — line totals counted in the background, external-change detection.
 5. **Highlighting** — per-language, visible rows only.

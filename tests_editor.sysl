@@ -7,7 +7,7 @@ import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text, create}
 import sysl.text.from_utf8
 import sysl.time.monotonic
 import sh.sysl.termbox2.{Event, Keyboard, Mouse, Resize, UnknownEvent, Key, REVERSE}
-import sh.sysl.termbox2.c.MOD_CTRL
+import sh.sysl.termbox2.c.{MOD_CTRL, MOD_SHIFT, MOD_MOTION}
 
 /** An editor over `text` in a file of its own, on a screen 40 by 10 (8 rows of text). */
 private fixture(text: string, w: int = 40, h: int = 10) -> (string, Editor)
@@ -21,9 +21,13 @@ private fixture(text: string, w: int = 40, h: int = 10) -> (string, Editor)
     ed.handle(Resized(w, h))
     (dir, ed)
 
-private key(ed: *Editor, k: Key) = ed.handle(Press(k, false))
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false, false))
 
-private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true))
+private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true, false))
+
+private shift(ed: *Editor, k: Key) = ed.handle(Press(k, false, true))
+
+private ctrl_shift(ed: *Editor, k: Key) = ed.handle(Press(k, true, true))
 
 private typed(ed: *Editor, s: string)
     for c in s.chars do ed.handle(Type(c))
@@ -405,7 +409,7 @@ ed_status()
 
     assert(g.row(8).starts_with(s" $name"))
     assert(g.row(8).ends_with("Ln 1 of 3, Col 1"), "a file the first screen reaches the end of has its total")
-    assert_eq(g.row(9), "^S Save  ^Q Quit  ^G Go to line  ^Z Undo  ^Y Redo")
+    assert_eq(g.row(9), "^S Save  ^Q Quit  ^F Find  ^R Replace  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^G Go to line")
     assert_eq(g.at(0, 9).fg & REVERSE, REVERSE)
 
     key(&ed, Down)
@@ -425,7 +429,9 @@ ed_typing_undo()
 
     key(&ed, Down)
     key(&ed, Right)
-    typed(&ed, "XY")
+    typed(&ed, "X")
+    ed.clock += 2000
+    typed(&ed, "Y")
     assert_eq(all(&ed), "one\ntXYwo\n")
     cursor_is(&ed, 7, 1)
 
@@ -777,8 +783,10 @@ ed_big_file()
 
 private said(i: Option[Input]) -> string = i match
     Some(Type(c)) -> s"type $c"
-    Some(Press(k, ctrl)) -> s"press $k $ctrl"
+    Some(Press(k, ctrl, shift)) -> s"press $k $ctrl $shift"
     Some(Click(x, y)) -> s"click $x $y"
+    Some(Drag(x, y)) -> s"drag $x $y"
+    Some(Paste(text)) -> s"paste $text"
     Some(Wheel(n)) -> s"wheel $n"
     Some(Resized(w, h)) -> s"resize $w $h"
     None -> "none"
@@ -786,10 +794,14 @@ private said(i: Option[Input]) -> string = i match
 @test("termbox's events become the editor's input")
 ed_input_of()
     assert_eq(said(input_of(Event(Keyboard, Nul, u32('é'), 0, 0, 0, 0, 0, 0))), "type é")
-    assert_eq(said(input_of(Event(Keyboard, Left, 0, 0, MOD_CTRL, 0, 0, 0, 0))), "press Left true")
-    assert_eq(said(input_of(Event(Keyboard, CtrlS, 0, 0, 0, 0, 0, 0, 0))), "press CtrlS false")
+    assert_eq(said(input_of(Event(Keyboard, Left, 0, 0, MOD_CTRL, 0, 0, 0, 0))), "press Left true false")
+    assert_eq(said(input_of(Event(Keyboard, Left, 0, 0, MOD_CTRL | MOD_SHIFT, 0, 0, 0, 0))), "press Left true true")
+    assert_eq(said(input_of(Event(Keyboard, End, 0, 0, MOD_SHIFT, 0, 0, 0, 0))), "press End false true")
+    assert_eq(said(input_of(Event(Keyboard, F3, 0, 0, MOD_SHIFT, 0, 0, 0, 0))), "press F3 false true")
+    assert_eq(said(input_of(Event(Keyboard, CtrlS, 0, 0, 0, 0, 0, 0, 0))), "press CtrlS false false")
     assert_eq(said(input_of(Event(Resize, Nul, 0, 0, 0, 100, 30, 0, 0))), "resize 100 30")
     assert_eq(said(input_of(Event(Mouse, MouseLeft, 0, 0, 0, 0, 0, 7, 3))), "click 7 3")
+    assert_eq(said(input_of(Event(Mouse, MouseLeft, 0, 0, MOD_MOTION, 0, 0, 9, 4))), "drag 9 4")
     assert_eq(said(input_of(Event(Mouse, MouseWheelUp, 0, 0, 0, 0, 0, 7, 3))), "wheel -3")
     assert_eq(said(input_of(Event(Mouse, MouseWheelDown, 0, 0, 0, 0, 0, 7, 3))), "wheel 3")
     assert_eq(said(input_of(Event(Mouse, MouseRelease, 0, 0, 0, 0, 0, 7, 3))), "none")

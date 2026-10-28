@@ -1,0 +1,579 @@
+@tests
+
+// Selecting, the clipboard, and what one undo step is: the editor driven with keys and the mouse,
+// with no terminal.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, create}
+import sysl.text.from_utf8
+import sh.sysl.termbox2.{Key, REVERSE}
+
+private fixture(text: string, w: int = 40, h: int = 10) -> (string, Editor)
+    val dir = make_temp_dir("te-select").unwrap()
+    val file = s"$dir/f.txt"
+
+    write_text(file, text).unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(w, h))
+    (dir, ed)
+
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false, false))
+
+private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true, false))
+
+private shift(ed: *Editor, k: Key) = ed.handle(Press(k, false, true))
+
+private ctrl_shift(ed: *Editor, k: Key) = ed.handle(Press(k, true, true))
+
+private typed(ed: *Editor, s: string)
+    for c in s.chars do ed.handle(Type(c))
+
+private all(ed: *Editor) -> string = from_utf8(ed.text.bytes(0, ed.text.size()).view()).unwrap()
+
+private cursor_is(ed: *Editor, at: u64, line: u64)
+    assert_eq((ed.at, ed.line), (at, line))
+    assert_eq(ed.text.line_of(ed.at), ed.line, "the kept line disagrees with the text")
+
+private drawn(ed: *Editor) -> Grid
+    var g = grid()
+
+    ed.render(&g)
+    g
+
+private reversed(g: Grid, x: int, y: int) -> bool = (g.at(x, y).fg & REVERSE) == REVERSE
+
+/** What the terminal is sent for a copy of `text`. */
+private osc(text: string) -> string = from_utf8(osc52(text.bytes).view()).unwrap()
+
+private sent(ed: *Editor) -> string
+    val out = from_utf8(ed.outbox.view()).unwrap()
+
+    ed.outbox.clear()
+    out
+
+// ---- extending the selection -------------------------------------------------------------------
+
+@test("Shift with the arrows, Home and End extends the selection; Left and Right without it go to its ends")
+sel_shift_arrows()
+    var (dir, ed) = fixture("abc\ndef\n")
+
+    assert_eq(ed.selection(), None)
+    shift(&ed, Right)
+    shift(&ed, Right)
+    assert_eq(ed.selection(), Some((0, 2)))
+    shift(&ed, Down)
+    assert_eq(ed.selection(), Some((0, 6)))
+    cursor_is(&ed, 6, 1)
+    shift(&ed, Left)
+    assert_eq(ed.selection(), Some((0, 5)))
+
+    key(&ed, Left)
+    assert_eq(ed.selection(), None)
+    cursor_is(&ed, 0, 0)
+
+    shift(&ed, End)
+    assert_eq(ed.selection(), Some((0, 3)))
+    key(&ed, Right)
+    assert_eq(ed.selection(), None)
+    cursor_is(&ed, 3, 0)
+
+    shift(&ed, Home)
+    assert_eq(ed.selection(), Some((0, 3)))
+    key(&ed, Down)
+    assert_eq(ed.selection(), None, "a move without Shift drops the selection")
+    cursor_is(&ed, 4, 1)
+
+    // Shift+Up back over the start of the selection turns it around the anchor.
+    shift(&ed, Right)
+    shift(&ed, Up)
+    assert_eq(ed.selection(), Some((1, 4)))
+    cursor_is(&ed, 1, 0)
+
+    // Left and Right with nothing selected still move one character.
+    key(&ed, Esc)
+    assert_eq(ed.selection(), None)
+    key(&ed, Right)
+    cursor_is(&ed, 2, 0)
+    remove_dir_all(dir).unwrap()
+end sel_shift_arrows
+
+@test("Ctrl+Shift moves by word and to either end, extending; a selection that shrinks to nothing is none")
+sel_ctrl_shift()
+    var (dir, ed) = fixture("abc\ndef ghi\n")
+
+    key(&ed, Down)
+    ctrl_shift(&ed, Right)
+    assert_eq(ed.selection(), Some((4, 7)))
+    ctrl_shift(&ed, Right)
+    assert_eq(ed.selection(), Some((4, 11)))
+    ctrl_shift(&ed, Left)
+    ctrl_shift(&ed, Left)
+    assert_eq(ed.selection(), None)
+    cursor_is(&ed, 4, 1)
+
+    ctrl_shift(&ed, End)
+    assert_eq(ed.selection(), Some((4, 12)))
+    cursor_is(&ed, 12, 2)
+    ctrl_shift(&ed, Home)
+    assert_eq(ed.selection(), Some((0, 4)))
+    cursor_is(&ed, 0, 0)
+    remove_dir_all(dir).unwrap()
+
+@test("Shift+PgDn and Shift+PgUp extend a page at a time")
+sel_pages()
+    var lines: Buf[u8] = buf()
+
+    for i in 0..<30 do lines.extend(s"line $i\n".bytes)
+
+    var (dir, ed) = fixture(from_utf8(lines.view()).unwrap())
+    val line8 = ed.text.line_start(8)
+
+    shift(&ed, PageDown)
+    assert_eq(ed.selection(), Some((0, line8)))
+    cursor_is(&ed, line8, 8)
+    shift(&ed, PageDown)
+    assert_eq(ed.selection(), Some((0, ed.text.line_start(16))))
+    shift(&ed, PageUp)
+    shift(&ed, PageUp)
+    assert_eq(ed.selection(), None)
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+A selects everything, and Delete or typing over it is one undo step")
+sel_all()
+    var (dir, ed) = fixture("ab\ncd")
+
+    drawn(&ed)
+    assert(ed.text.lines_known())
+    key(&ed, CtrlA)
+    assert_eq(ed.selection(), Some((0, 5)))
+    cursor_is(&ed, 5, 1)
+
+    typed(&ed, "Z")
+    assert_eq(all(&ed), "Z")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "ab\ncd")
+    cursor_is(&ed, 5, 1)
+    assert(!ed.text.modified())
+
+    key(&ed, CtrlA)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "")
+    cursor_is(&ed, 0, 0)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "ab\ncd")
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+A on an empty file selects nothing, and the keys that act on a selection do nothing")
+sel_all_empty()
+    var (dir, ed) = fixture("")
+
+    key(&ed, CtrlA)
+    assert_eq(ed.selection(), None)
+    key(&ed, Delete)
+    key(&ed, CtrlX)
+    assert_eq(ed.message, "Nothing is selected")
+    assert(!ed.text.modified())
+    remove_dir_all(dir).unwrap()
+
+// ---- editing a selection -----------------------------------------------------------------------
+
+@test("typing replaces the selection and Backspace, Delete and Enter remove it, each as one undo step")
+sel_replace()
+    var (dir, ed) = fixture("hello world\n")
+
+    ctrl_shift(&ed, Right)
+    typed(&ed, "X")
+    assert_eq(all(&ed), "X world\n")
+    cursor_is(&ed, 1, 0)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "hello world\n")
+    cursor_is(&ed, 5, 0)
+    assert_eq(ed.selection(), None, "undo drops the selection")
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "X world\n")
+    cursor_is(&ed, 1, 0)
+
+    shift(&ed, Right)
+    shift(&ed, Right)
+    key(&ed, Backspace2)
+    assert_eq(all(&ed), "Xorld\n")
+    cursor_is(&ed, 1, 0)
+
+    shift(&ed, Right)
+    shift(&ed, Right)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "Xld\n")
+
+    // A selection made backwards is removed the same, with the cursor at its start.
+    key(&ed, End)
+    shift(&ed, Left)
+    shift(&ed, Left)
+    key(&ed, Backspace2)
+    assert_eq(all(&ed), "X\n")
+    cursor_is(&ed, 1, 0)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "Xld\n")
+    cursor_is(&ed, 1, 0)
+    remove_dir_all(dir).unwrap()
+end sel_replace
+
+@test("Enter over a selection keeps the indentation, and a selection across lines is replaced whole")
+sel_enter()
+    var (dir, ed) = fixture("  ab cd\nef\n")
+
+    key(&ed, End)
+    ctrl(&ed, Left)
+    shift(&ed, Left)
+    key(&ed, Enter)
+    assert_eq(all(&ed), "  ab\n  cd\nef\n")
+    cursor_is(&ed, 7, 1)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "  ab cd\nef\n")
+
+    ctrl(&ed, Home)
+    key(&ed, Right)
+    key(&ed, Right)
+    shift(&ed, Down)
+    shift(&ed, Down)
+    typed(&ed, "!")
+    assert_eq(all(&ed), "  !")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "  ab cd\nef\n")
+    remove_dir_all(dir).unwrap()
+
+@test("a selection crosses a CRLF whole, and copying and pasting it keeps both bytes")
+sel_crlf()
+    var (dir, ed) = fixture("ab\r\ncd\r\n")
+
+    shift(&ed, End)
+    assert_eq(ed.selection(), Some((0, 2)))
+    shift(&ed, Right)
+    assert_eq(ed.selection(), Some((0, 4)))
+    cursor_is(&ed, 4, 1)
+
+    key(&ed, CtrlC)
+    assert_eq(sent(&ed), osc("ab\r\n"))
+    assert_eq(osc("ab\r\n"), "\u{1b}]52;c;YWINCg==\u{7}")
+    ctrl(&ed, End)
+    key(&ed, CtrlV)
+    assert_eq(all(&ed), "ab\r\ncd\r\nab\r\n")
+    cursor_is(&ed, 12, 3)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "ab\r\ncd\r\n")
+    remove_dir_all(dir).unwrap()
+
+@test("the selection is drawn reversed, a tab in it as reversed blanks, and a selected line break as one cell")
+sel_drawn()
+    var (dir, ed) = fixture("ab\tc\nxy\n")
+
+    key(&ed, Right)
+    shift(&ed, End)
+    shift(&ed, Right)
+    assert_eq(ed.selection(), Some((1, 5)))
+
+    val g = drawn(&ed)
+
+    assert_eq(g.row(0), "1 ab  c")
+    assert(!reversed(g, 2, 0))
+    assert(reversed(g, 3, 0))
+    assert(reversed(g, 4, 0) && reversed(g, 5, 0), "the tab")
+    assert(reversed(g, 6, 0))
+    assert(reversed(g, 7, 0), "the line break")
+    assert(!reversed(g, 8, 0))
+    assert(!reversed(g, 2, 1))
+    assert_eq(g.cursor, Some((2, 1)))
+    remove_dir_all(dir).unwrap()
+
+// ---- the clipboard -------------------------------------------------------------------------------
+
+@test("OSC 52 is ESC ] 52 ; c ; base64 BEL, exactly")
+sel_osc52()
+    assert_eq(osc("hello"), "\u{1b}]52;c;aGVsbG8=\u{7}")
+    assert_eq(osc(""), "\u{1b}]52;c;\u{7}")
+    assert_eq(osc("one\ntwo\n"), "\u{1b}]52;c;b25lCnR3bwo=\u{7}")
+
+@test("cut and paste of several lines: the system clipboard gets the text, and each is one undo step")
+sel_cut_paste()
+    var (dir, ed) = fixture("one\ntwo\nthree\n")
+
+    shift(&ed, Down)
+    shift(&ed, Down)
+    key(&ed, CtrlX)
+    assert_eq(all(&ed), "three\n")
+    assert_eq(ed.message, "Cut 8 bytes")
+    assert_eq(sent(&ed), osc("one\ntwo\n"))
+    cursor_is(&ed, 0, 0)
+
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "one\ntwo\nthree\n")
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "three\n")
+
+    ctrl(&ed, End)
+    key(&ed, CtrlV)
+    assert_eq(all(&ed), "three\none\ntwo\n")
+    cursor_is(&ed, 14, 3)
+    key(&ed, CtrlV)
+    assert_eq(all(&ed), "three\none\ntwo\none\ntwo\n")
+    cursor_is(&ed, 22, 5)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "three\none\ntwo\n")
+    cursor_is(&ed, 14, 3)
+
+    // A paste over a selection replaces it, as one step.
+    ctrl(&ed, Home)
+    shift(&ed, End)
+    key(&ed, CtrlV)
+    assert_eq(all(&ed), "one\ntwo\n\none\ntwo\n")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "three\none\ntwo\n")
+    remove_dir_all(dir).unwrap()
+end sel_cut_paste
+
+@test("copy leaves the text alone; with nothing selected, copy and cut say so, and paste with nothing copied does nothing")
+sel_copy_errors()
+    var (dir, ed) = fixture("abc\n")
+
+    key(&ed, CtrlV)
+    assert_eq(ed.message, "Nothing has been copied")
+    key(&ed, CtrlC)
+    assert_eq(ed.message, "Nothing is selected")
+    key(&ed, CtrlX)
+    assert_eq(ed.message, "Nothing is selected")
+    assert_eq(ed.outbox.len(), 0)
+    assert(!ed.text.modified())
+
+    shift(&ed, Right)
+    key(&ed, CtrlC)
+    assert_eq(ed.message, "Copied 1 byte")
+    assert_eq(all(&ed), "abc\n")
+    assert_eq(ed.selection(), Some((0, 1)), "copy keeps the selection")
+    assert(!ed.text.modified())
+    remove_dir_all(dir).unwrap()
+
+@test("a copy over the system clipboard's limit is kept for te and not sent, and says so; one at the limit is sent")
+sel_copy_cap()
+    var big: Buf[u8] = buf()
+
+    for _ in 0..<osc52_limit do big.push(u8('a'))
+
+    var (dir, ed) = fixture(from_utf8(big.view()).unwrap())
+
+    drawn(&ed)
+    key(&ed, CtrlA)
+    key(&ed, CtrlC)
+    assert_eq(ed.message, "Copied 256 KiB")
+    assert_eq(u64(ed.outbox.len()), 8 + (osc52_limit + 2) / 3 * 4)
+    ed.outbox.clear()
+
+    key(&ed, End)
+    typed(&ed, "b")
+    key(&ed, CtrlA)
+    key(&ed, CtrlC)
+    assert_eq(ed.outbox.len(), 0)
+    assert_eq(ed.message, "Copied 256 KiB, too much for the system clipboard (256 KiB at most): paste it in te")
+
+    ctrl(&ed, End)
+    key(&ed, CtrlV)
+    assert_eq(ed.text.size(), 2 * (osc52_limit + 1), "te's own clipboard has all of it")
+    remove_dir_all(dir).unwrap()
+
+@test("the clipboard still pastes after a save and after the text it came from is gone")
+sel_clip_survives()
+    var (dir, ed) = fixture("keep me\n")
+
+    shift(&ed, End)
+    key(&ed, CtrlX)
+    key(&ed, CtrlS)
+    assert_eq(all(&ed), "\n")
+    typed(&ed, "x")
+    key(&ed, CtrlV)
+    assert_eq(all(&ed), "xkeep me\n")
+    remove_dir_all(dir).unwrap()
+
+@test("pasted text is inserted as it is, never indented, a lone CR made a line break, as one undo step")
+sel_bracketed_paste()
+    var (dir, ed) = fixture("    x\n")
+
+    key(&ed, End)
+    ed.handle(Paste("a\r\n  b\rc"))
+    assert_eq(all(&ed), "    xa\r\n  b\nc\n")
+    cursor_is(&ed, 13, 2)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "    x\n")
+    cursor_is(&ed, 5, 0)
+
+    shift(&ed, Left)
+    ed.handle(Paste("y"))
+    assert_eq(all(&ed), "    y\n")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "    x\n")
+
+    ed.handle(Paste(""))
+    assert(!ed.text.modified(), "an empty paste changes nothing")
+    remove_dir_all(dir).unwrap()
+
+// ---- the mouse -----------------------------------------------------------------------------------
+
+@test("a drag selects from where the button went down; a click drops the selection")
+sel_drag()
+    var (dir, ed) = fixture("hello world\nsecond line\n")
+
+    ed.handle(Click(3, 0))
+    cursor_is(&ed, 1, 0)
+    assert_eq(ed.selection(), None)
+    ed.handle(Drag(7, 1))
+    assert_eq(ed.selection(), Some((1, 17)))
+    ed.handle(Drag(20, 20))
+    assert_eq(ed.selection(), Some((1, 24)), "below the text is its last line")
+    assert(reversed(drawn(&ed), 2, 1))
+
+    ed.handle(Click(4, 0))
+    assert_eq(ed.selection(), None)
+    typed(&ed, "!")
+    assert_eq(all(&ed), "he!llo world\nsecond line\n", "typing after a click inserts")
+    remove_dir_all(dir).unwrap()
+
+@test("a drag above or below the view scrolls it a line at a time")
+sel_drag_scrolls()
+    var lines: Buf[u8] = buf()
+
+    for i in 0..<30 do lines.extend(s"line $i\n".bytes)
+
+    var (dir, ed) = fixture(from_utf8(lines.view()).unwrap())
+
+    ed.handle(Click(0, 0))
+    ed.handle(Drag(0, 8))
+    assert_eq(ed.line, 8)
+    assert_eq(ed.top, 1)
+    ed.handle(Drag(0, 9))
+    assert_eq(ed.line, 9)
+    assert_eq(ed.top, 2)
+    ed.handle(Drag(0, -1))
+    assert_eq(ed.line, 1)
+    assert_eq(ed.top, 1)
+    assert_eq(ed.selection(), Some((0, ed.text.line_start(1))))
+    remove_dir_all(dir).unwrap()
+
+@test("a double click selects the word, or the one character that is not in a word; a slow or moved one does not")
+sel_double_click()
+    var (dir, ed) = fixture("hello world\n")
+
+    ed.clock = 1000
+    ed.handle(Click(9, 0))
+    ed.clock = 1200
+    ed.handle(Click(9, 0))
+    assert_eq(ed.selection(), Some((6, 11)))
+    cursor_is(&ed, 11, 0)
+
+    ed.clock = 5000
+    ed.handle(Click(7, 0))
+    ed.clock = 5100
+    ed.handle(Click(7, 0))
+    assert_eq(ed.selection(), Some((5, 6)), "the space")
+
+    ed.clock = 9000
+    ed.handle(Click(3, 0))
+    ed.clock = 9401
+    ed.handle(Click(3, 0))
+    assert_eq(ed.selection(), None, "too slow")
+
+    ed.clock = 12000
+    ed.handle(Click(3, 0))
+    ed.clock = 12100
+    ed.handle(Click(4, 0))
+    assert_eq(ed.selection(), None, "moved")
+
+    ed.clock = 15000
+    ed.handle(Click(20, 0))
+    ed.clock = 15100
+    ed.handle(Click(20, 0))
+    assert_eq(ed.selection(), None, "past the end of the line there is no word")
+    remove_dir_all(dir).unwrap()
+end sel_double_click
+
+// ---- what one undo step is ------------------------------------------------------------------------
+
+@test("typing is one undo step per word with the spaces after it")
+undo_words()
+    var (dir, ed) = fixture("")
+
+    typed(&ed, "hello world  again")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "hello world  ")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "hello ")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "")
+    cursor_is(&ed, 0, 0)
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "hello ")
+    cursor_is(&ed, 6, 0)
+
+    // Punctuation after a word joins it; a word after punctuation starts a step.
+    key(&ed, CtrlZ)
+    typed(&ed, "a.b")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "a.")
+    remove_dir_all(dir).unwrap()
+
+@test("a pause of more than a second, a cursor move, Enter or another kind of edit ends a run of typing")
+undo_breaks()
+    var (dir, ed) = fixture("")
+
+    typed(&ed, "ab")
+    ed.clock += 1000
+    typed(&ed, "c")
+    ed.clock += 1001
+    typed(&ed, "d")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abc", "a pause of a second exactly still joins")
+
+    key(&ed, Left)
+    key(&ed, Right)
+    typed(&ed, "e")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abc", "a move ends the run")
+
+    key(&ed, Enter)
+    typed(&ed, "f")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abc\n")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abc")
+
+    typed(&ed, "g")
+    key(&ed, Backspace2)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abcg", "Backspace after typing is a step of its own")
+    remove_dir_all(dir).unwrap()
+
+@test("a run of Backspace and Delete is one step, and a save in the middle of a run ends it")
+undo_erasing_and_save()
+    var (dir, ed) = fixture("abcdef\n")
+
+    key(&ed, Right)
+    key(&ed, Right)
+    key(&ed, Right)
+    key(&ed, Backspace2)
+    key(&ed, Backspace2)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "aef\n")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abcdef\n")
+    cursor_is(&ed, 3, 0)
+
+    key(&ed, End)
+    typed(&ed, "xy")
+    key(&ed, CtrlS)
+    typed(&ed, "z")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abcdefxy\n")
+    assert(!ed.text.modified(), "undo goes back to the text that was saved")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abcdef\n")
+    assert(ed.text.modified())
+    remove_dir_all(dir).unwrap()
+end undo_erasing_and_save

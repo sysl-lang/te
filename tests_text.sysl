@@ -256,6 +256,74 @@ private check_lines(t: *Text, model: string, r: *Rng)
     if seen < want then start = u64(model.bytes.len)
     assert_eq(t.line_start(want), start)
 
+@test("a slice of any part, across pieces, pastes back the same bytes and lines, in one version")
+txt_slice()
+    val (dir, t0) = opened("ab\ncd\nef\ngh\n", 4)
+    var t = t0
+
+    t.insert(5, "X\nY".bytes)
+    assert_eq(all(t), "ab\ncdX\nY\nef\ngh\n")
+
+    val text = all(t)
+
+    for from in 0..t.size()
+        for to in from..t.size()
+            val piece = t.slice(from, to)
+            val want = from_utf8(text.bytes[usize(from)..<usize(to)]).unwrap()
+
+            assert_eq(slice_size(piece), to - from)
+            assert_eq(t.slice_lines(piece), newlines_in(want))
+
+            val now = t.now
+
+            t.insert_slice(3, piece)
+            assert_eq(all(t), s"${text[0..<3]}$want${text[3..]}", s"$from..<$to")
+            assert_eq(t.line_count(), newlines_in(text) + newlines_in(want) + 1)
+            if to > from then assert_eq(t.now, now + 1, "one version") else assert_eq(t.now, now, "an empty slice makes no version")
+            if to > from then assert(t.undo())
+            assert_eq(all(t), text)
+
+    remove_dir_all(dir).unwrap()
+end txt_slice
+
+@test("squash makes several versions one undo step, keeps a save of the last, and forgets a save in between")
+txt_squash()
+    val (dir, file) = fixture("abc")
+    var t = open(file).unwrap()
+
+    t.insert(3, "d".bytes)
+    t.insert(4, "e".bytes)
+    t.insert(5, "f".bytes)
+    t.squash(1)
+    assert_eq(t.now, 2)
+    assert(t.undo())
+    assert_eq(all(t), "abcd")
+    assert(t.redo())
+    assert_eq(all(t), "abcdef")
+    assert(!t.redo())
+
+    // Nothing to fold: no change.
+    t.squash(1)
+    t.squash(5)
+    assert_eq(t.now, 2)
+
+    t.save().unwrap()
+    t.insert(0, "1".bytes)
+    t.insert(0, "2".bytes)
+    t.squash(1)
+    assert(t.modified(), "the saved version was folded away")
+    assert(t.undo())
+    assert_eq(all(t), "abcd")
+
+    t.insert(0, "x".bytes)
+    t.save().unwrap()
+    t.squash(0)
+    assert(!t.modified(), "the saved version is the one kept")
+    assert(t.undo())
+    assert_eq(all(t), "abc")
+    remove_dir_all(dir).unwrap()
+end txt_squash
+
 @test("thousands of random edits, undos and redos agree with a string model at every step")
 txt_random_against_model()
     var r = rng(0x7E7E, 1)

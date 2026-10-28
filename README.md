@@ -16,12 +16,22 @@ sysl test .
 `te` with no file is an unnamed buffer that asks for a name on Ctrl+S; a file that does not exist yet
 is created on the first save.
 
-**Status:** milestones 1 and 2 are done. The view shows line numbers, scrolls sideways for long
+**Status:** milestones 1 to 3 are done, but for bracketed paste. The view shows line numbers, scrolls sideways for long
 lines, draws tabs to a width of 4 and East Asian wide characters in two cells. Typing, Enter (keeping
 the line's indentation, and a CRLF file's line breaks), Backspace and Delete, the arrows, Home/End
 (Home goes to the indentation first), PgUp/PgDn, Ctrl+Home/End and Ctrl+arrows by word all work, as
 do Ctrl+Z / Ctrl+Y (the cursor goes back with the text), Ctrl+S, Ctrl+Q (asks when there are unsaved
 changes), Ctrl+G (`line` or `line:column`), clicking and the wheel. Combining marks are not drawn on
 their base character yet (the termbox2 package is built without grapheme-cluster cells); the cursor
-already moves over a character and its marks as one. Selection, the clipboard, find and undo grouping
-come next.
+already moves over a character and its marks as one.
+
+Shift with any move selects, as do Ctrl+A, a drag and a double click; typing, Backspace, Delete and
+Enter replace the selection. Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste — the copy also reaches the
+system clipboard by OSC 52, over ssh too, up to 256 KiB. Ctrl+F finds as you type (any case; Ctrl+T
+makes case matter), Enter and F3 go to the next match, Shift+F3 to the one before, and a long search
+over a huge file shows its progress and stops on Esc. Ctrl+R replaces one at a time (Y / N) or all
+(A). Typing undoes a word at a time; a paste, a replaced selection and a replace-all undo in one step.
+
+Bracketed paste is not on yet: termbox2 reads a terminal's paste markers as Escape and four typed
+characters, so a terminal paste arrives as typing (and Enter keeps its indentation) until the termbox2
+package can hand te the paste.

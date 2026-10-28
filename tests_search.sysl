@@ -1,0 +1,501 @@
+@tests
+
+// Find and replace: as the query is typed, next and previous with wrap-around, case, a file too large
+// to search in one go, and replace one or all as one undo step.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, create}
+import sysl.text.from_utf8
+import sysl.time.monotonic
+import sh.sysl.termbox2.{Key, REVERSE, YELLOW}
+
+private fixture(text: string, w: int = 80, h: int = 10) -> (string, Editor)
+    val dir = make_temp_dir("te-search").unwrap()
+    val file = s"$dir/f.txt"
+
+    write_text(file, text).unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(w, h))
+    (dir, ed)
+
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false, false))
+
+private shift(ed: *Editor, k: Key) = ed.handle(Press(k, false, true))
+
+/** A key, and then the search it starts run to its end. */
+private search_key(ed: *Editor, k: Key, shifted: bool = false)
+    ed.handle(Press(k, false, shifted))
+    ed.finish()
+
+private typed(ed: *Editor, s: string)
+    for c in s.chars do ed.handle(Type(c))
+    ed.finish()
+
+private all(ed: *Editor) -> string = from_utf8(ed.text.bytes(0, ed.text.size()).view()).unwrap()
+
+private drawn(ed: *Editor) -> Grid
+    var g = grid()
+
+    ed.render(&g)
+    g
+
+private ask(ed: *Editor, query: string, with: string)
+    key(ed, CtrlR)
+    typed(ed, query)
+    key(ed, Enter)
+    typed(ed, with)
+    search_key(ed, Enter)
+
+// ---- finding ---------------------------------------------------------------------------------------
+
+@test("Ctrl+F searches as the query is typed, ignoring case, and shows the matches on screen")
+find_incremental()
+    var (dir, ed) = fixture("Alpha beta\nalpha BETA alpha\ngamma\n")
+
+    key(&ed, CtrlF)
+    typed(&ed, "al")
+    assert_eq(ed.selection(), Some((0, 2)))
+    typed(&ed, "pha")
+    assert_eq(ed.selection(), Some((0, 5)))
+    assert_eq((ed.at, ed.line), (5, 0))
+
+    val g = drawn(&ed)
+
+    assert(g.row(8).starts_with(" Find (any case): alpha"))
+    assert_eq(g.cursor, Some((23, 8)), "the cursor is in the prompt")
+    assert_eq(g.row(9), "Enter Next  Shift+F3 Previous  ^T Match case  Esc Done")
+    assert((g.at(2, 0).fg & REVERSE) == REVERSE, "the current match is selected")
+    assert_eq(g.at(2, 1).bg, YELLOW)
+    assert_eq(g.at(6, 1).bg, YELLOW)
+    assert(g.at(7, 1).bg != YELLOW)
+    assert_eq(g.at(13, 1).bg, YELLOW)
+    assert(g.at(2, 2).bg != YELLOW)
+
+    // A query that shrinks searches again from where the prompt opened.
+    key(&ed, Backspace2)
+    ed.finish()
+    assert_eq(ed.selection(), Some((0, 4)))
+    key(&ed, Backspace2)
+    key(&ed, Backspace2)
+    key(&ed, Backspace2)
+    key(&ed, Backspace2)
+    ed.finish()
+    assert_eq(ed.selection(), None)
+    assert_eq((ed.at, ed.line), (0, 0))
+    assert(drawn(&ed).at(2, 1).bg != YELLOW, "an empty query shows nothing")
+    remove_dir_all(dir).unwrap()
+end find_incremental
+
+@test("Enter and F3 go to the next match, Shift+F3 to the one before, and both wrap around and say so")
+find_next_previous()
+    var (dir, ed) = fixture("Alpha beta\nalpha BETA alpha\ngamma\n")
+
+    key(&ed, CtrlF)
+    typed(&ed, "alpha")
+    assert_eq(ed.selection(), Some((0, 5)))
+    search_key(&ed, Enter)
+    assert_eq(ed.selection(), Some((11, 16)))
+    assert_eq(ed.line, 1)
+    search_key(&ed, F3)
+    assert_eq(ed.selection(), Some((22, 27)))
+    assert_eq(ed.message, "")
+    search_key(&ed, F3)
+    assert_eq(ed.selection(), Some((0, 5)))
+    assert_eq(ed.message, "Search wrapped to the start")
+    assert(drawn(&ed).row(8).contains("Search wrapped to the start"), "the note is beside the prompt")
+
+    search_key(&ed, F3, true)
+    assert_eq(ed.selection(), Some((22, 27)))
+    assert_eq(ed.message, "Search wrapped to the end")
+    search_key(&ed, F3, true)
+    assert_eq(ed.selection(), Some((11, 16)))
+
+    // Esc closes the prompt and keeps the match selected; F3 still works without it.
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+    assert_eq(ed.selection(), Some((11, 16)))
+    search_key(&ed, F3)
+    assert_eq(ed.selection(), Some((22, 27)))
+    search_key(&ed, F3, true)
+    assert_eq(ed.selection(), Some((11, 16)))
+
+    // Esc in the text drops the selection and the highlighting.
+    key(&ed, Esc)
+    assert_eq(ed.selection(), None)
+    assert(drawn(&ed).at(2, 0).bg != YELLOW)
+    remove_dir_all(dir).unwrap()
+end find_next_previous
+
+@test("Ctrl+T in the prompt makes case matter, and back")
+find_case()
+    var (dir, ed) = fixture("Alpha beta\nalpha BETA alpha\ngamma\n")
+
+    key(&ed, CtrlF)
+    typed(&ed, "BETA")
+    assert_eq(ed.selection(), Some((6, 10)))
+    key(&ed, CtrlT)
+    ed.finish()
+    assert(ed.match_case)
+    assert_eq(ed.selection(), Some((17, 21)))
+    assert(drawn(&ed).row(8).starts_with(" Find (match case): BETA"))
+    assert_eq(drawn(&ed).at(8, 0).bg != YELLOW, true, "a match of another case is not shown")
+    key(&ed, CtrlT)
+    ed.finish()
+    assert_eq(ed.selection(), Some((6, 10)))
+    remove_dir_all(dir).unwrap()
+
+@test("a query with no match says so and leaves the cursor where the prompt opened; F3 with no query asks for one")
+find_none()
+    var (dir, ed) = fixture("abc\ndef\n")
+
+    key(&ed, F3)
+    assert(ed.prompt == Finding, "F3 before anything was searched for opens the prompt")
+    search_key(&ed, Enter)
+    assert(ed.prompt == Finding, "Enter with nothing typed asks again")
+    key(&ed, Esc)
+
+    key(&ed, Down)
+    key(&ed, CtrlF)
+    typed(&ed, "xyz")
+    assert_eq(ed.message, "Not found: xyz")
+    assert_eq((ed.at, ed.line), (4, 1))
+    assert_eq(ed.selection(), None)
+    search_key(&ed, F3)
+    assert_eq(ed.message, "Not found: xyz")
+    assert_eq((ed.at, ed.line), (4, 1))
+    remove_dir_all(dir).unwrap()
+
+@test("non-ASCII text matches only itself; a match next to it is found and highlighted on the right cells")
+find_unicode()
+    var (dir, ed) = fixture("中文 Ünï ünï\n")
+
+    key(&ed, CtrlF)
+    typed(&ed, "ünï")
+    assert_eq(ed.selection(), Some((13, 18)))
+    key(&ed, Esc)
+    key(&ed, Home)
+
+    val g = drawn(&ed)
+
+    assert(g.at(7, 0).bg != YELLOW, "Ü is not ü")
+    assert(g.at(10, 0).bg != YELLOW)
+    assert_eq(g.at(11, 0).bg, YELLOW)
+    assert_eq(g.at(13, 0).bg, YELLOW)
+    assert(g.at(14, 0).bg != YELLOW)
+    remove_dir_all(dir).unwrap()
+
+/** Where the next match at or after `from` starts, wrapping, in a model of the search. */
+private model_next(text: string, needle: string, from: u64) -> Option[u64]
+    val t = text.bytes
+    val n = needle.bytes
+
+    for k in 0..<t.len
+        val i = (usize(from) + k) % t.len
+
+        if match_at(t, i, n, true) then return Some(u64(i))
+
+    None
+
+/** Where the last match starting before `from` starts, wrapping. */
+private model_prev(text: string, needle: string, from: u64) -> Option[u64]
+    val t = text.bytes
+    val n = needle.bytes
+
+    for k in 1..t.len
+        val i = (usize(from) + t.len - k) % t.len
+
+        if match_at(t, i, n, true) then return Some(u64(i))
+
+    None
+
+@test("searching in windows of a few bytes finds what one pass would, from every place, both ways, across window edges")
+find_windows()
+    val text = "abxab\nbaabab\nb"
+    var (dir, ed) = fixture(text)
+
+    ed.query.extend("ab".bytes)
+    for from in 0..ed.text.size()
+        for back in [false, true]
+            ed.anchor = None
+            ed.place(from, ed.text.line_of(from))
+            ed.start(Show, back, from)
+            while ed.busy() do ed.work(3)
+
+            val want = if back then model_prev(text, "ab", from) else model_next(text, "ab", from)
+
+            assert_eq(ed.selection().map(s -> s.0), want, s"from $from back $back")
+
+    ed.query.clear()
+    ed.query.extend("x".bytes)
+    ed.start(Show, true, 0)
+    while ed.busy() do ed.work(1)
+    assert_eq(ed.selection(), Some((2, 3)))
+    remove_dir_all(dir).unwrap()
+end find_windows
+
+// ---- a large file ------------------------------------------------------------------------------------
+
+/** A 20 MB file (`big_lines` of them) of 100-byte lines, with `needle` written over line `at`'s filler. */
+private big_file(dir: string, needle: string, at: u64) -> string
+    val file = s"$dir/big.txt"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    for i in 0..<big_lines
+        val number = s"$i".bytes
+
+        for _ in number.len..<12 do chunk.push(u8('0'))
+        chunk.extend(number)
+        if i == at
+            chunk.extend(needle.bytes)
+            for _ in 12 + needle.len..<99 do chunk.push(u8('.'))
+        else
+            for _ in 12..<99 do chunk.push(u8('.'))
+        chunk.push(u8('\n'))
+
+    f.write(chunk.view())
+    f.close().unwrap()
+    file
+
+@test("a search of a 20 MB file finds a match near its end, reading no further than it, without counting the lines after it")
+find_big()
+    val dir = make_temp_dir("te-search").unwrap()
+    val line = big_lines - 10
+    var ed = load(big_file(dir, "NeedLe", line)).unwrap()
+
+    ed.handle(Resized(120, 40))
+    drawn(&ed)
+
+    val start = monotonic().us
+
+    key(&ed, CtrlF)
+    for c in "needle".chars do ed.handle(Type(c))
+    assert(ed.busy())
+    assert(drawn(&ed).row(38).contains("Searching, 0% (Esc stops)"))
+    assert_eq(drawn(&ed).row(39), "Esc Stop")
+    ed.finish()
+
+    val took = (monotonic().us - start) / 1000
+    val hit = line * 100 + 12
+
+    assert_eq(ed.selection(), Some((hit, hit + 6)))
+    assert_eq(ed.line, line)
+    assert(ed.searched >= hit, "it read up to the match")
+    assert(ed.searched <= hit + search_step + 64, s"it read ${ed.searched} bytes to find one at $hit")
+    assert(ed.text.scanned <= hit + (1 << 20), s"it counted the lines of ${ed.text.scanned} bytes")
+    assert(!ed.text.lines_known(), "the lines after the match were not counted")
+    assert(took < 3000, s"the search took $took ms")
+    assert(drawn(&ed).row(37).contains("NeedLe"), "the match is on screen")
+    remove_dir_all(dir).unwrap()
+end find_big
+
+@test("Esc stops a search of a 20 MB file part of the way, puts the cursor back, and keeps the prompt")
+find_big_cancel()
+    val dir = make_temp_dir("te-search").unwrap()
+    var ed = load(big_file(dir, "", 0)).unwrap()
+
+    ed.handle(Resized(120, 40))
+    key(&ed, Down)
+    key(&ed, CtrlF)
+    for c in "absent".chars do ed.handle(Type(c))
+    ed.work(1 << 20)
+    assert(ed.busy())
+    assert(drawn(&ed).row(38).contains("Searching, 5% (Esc stops)"))
+
+    // Keys other than Esc that would edit wait while it runs.
+    key(&ed, Esc)
+    assert(!ed.busy())
+    assert_eq(ed.message, "Search stopped")
+    assert(ed.prompt == Finding)
+    assert_eq((ed.at, ed.line), (100, 1))
+    assert(ed.searched <= (1 << 20) + 6, s"read ${ed.searched}")
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+
+    // A search from the text, not the prompt: typing does nothing until it is stopped.
+    search_key(&ed, F3)
+    assert_eq(ed.message, "Not found: absent")
+    ed.handle(Press(F3, false, false))
+    ed.work(1 << 20)
+    ed.handle(Type('x'))
+    assert(!ed.text.modified(), "typing waits for the search")
+    key(&ed, Esc)
+    assert(!ed.busy())
+    ed.handle(Type('x'))
+    assert(ed.text.modified())
+    remove_dir_all(dir).unwrap()
+end find_big_cancel
+
+@test("selecting all of a 20 MB file, copying it and deleting it read none of it; a paste brings it back")
+select_all_big()
+    val dir = make_temp_dir("te-search").unwrap()
+    var ed = load(big_file(dir, "", 0)).unwrap()
+
+    ed.handle(Resized(120, 40))
+    drawn(&ed)
+
+    val read = ed.text.scanned
+    val size = ed.text.size()
+
+    key(&ed, CtrlA)
+    assert_eq(ed.selection(), Some((0, size)))
+    assert_eq((ed.at, ed.line), (0, 0), "the cursor stays where no counting is needed")
+    key(&ed, CtrlC)
+    assert_eq(ed.outbox.len(), 0, "too large for the system clipboard")
+    key(&ed, Delete)
+    assert_eq(ed.text.size(), 0)
+    assert_eq(ed.text.scanned, read, "nothing more was read")
+
+    key(&ed, CtrlV)
+    assert_eq(ed.text.size(), size)
+    assert_eq(ed.line, big_lines)
+    key(&ed, CtrlZ)
+    key(&ed, CtrlZ)
+    assert_eq(ed.text.size(), size)
+    assert(!ed.text.modified())
+    remove_dir_all(dir).unwrap()
+
+// ---- replacing ---------------------------------------------------------------------------------------
+
+@test("Ctrl+R asks what and with what, then each match: Y replaces it, N skips it, Esc stops; each replacement is one undo step")
+replace_one_by_one()
+    var (dir, ed) = fixture("cat Cat cat\ndog cat\n")
+
+    key(&ed, CtrlR)
+    assert(drawn(&ed).row(8).starts_with(" Replace (any case):"))
+    typed(&ed, "cat")
+    key(&ed, Enter)
+    assert(drawn(&ed).row(8).starts_with(" Replace cat with:"))
+    typed(&ed, "lion")
+    search_key(&ed, Enter)
+    assert(ed.prompt == Confirming)
+    assert_eq(ed.selection(), Some((0, 3)))
+    assert(drawn(&ed).row(8).starts_with(" Replace this with lion?"))
+    assert_eq(drawn(&ed).row(9), "Y Replace  N Skip  A All  Esc Stop")
+
+    ed.handle(Type('y'))
+    ed.finish()
+    assert_eq(all(&ed), "lion Cat cat\ndog cat\n")
+    assert_eq(ed.selection(), Some((5, 8)))
+    ed.handle(Type('n'))
+    ed.finish()
+    assert_eq(ed.selection(), Some((9, 12)))
+    search_key(&ed, Enter)
+    assert_eq(all(&ed), "lion Cat lion\ndog cat\n")
+    assert_eq(ed.selection(), Some((18, 21)))
+    assert_eq(ed.line, 1)
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "lion Cat cat\ndog cat\n")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "cat Cat cat\ndog cat\n")
+    assert(!ed.text.modified())
+    remove_dir_all(dir).unwrap()
+end replace_one_by_one
+
+@test("A replaces every match in the text as one undo step, keeping the cursor's place; an empty query reuses the last")
+replace_all()
+    var (dir, ed) = fixture("cat Cat cat\ndog cat\n")
+
+    ask(&ed, "cat", "lion")
+    ed.handle(Type('n'))
+    ed.finish()
+    assert_eq(ed.selection(), Some((4, 7)))
+    ed.handle(Type('a'))
+    ed.finish()
+    assert_eq(all(&ed), "lion lion lion\ndog lion\n")
+    assert_eq(ed.message, "Replaced 4")
+    assert(ed.prompt == Idle)
+    assert_eq((ed.at, ed.line), (9, 0), "the cursor stays after the match it was on")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "cat Cat cat\ndog cat\n")
+    assert(!ed.text.modified())
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "lion lion lion\ndog lion\n")
+
+    // Enter on an empty query replaces what was searched for last.
+    key(&ed, CtrlR)
+    key(&ed, Enter)
+    typed(&ed, "ox")
+    search_key(&ed, Enter)
+    assert(ed.prompt == Idle)
+    assert_eq(ed.message, "Not found: cat")
+    remove_dir_all(dir).unwrap()
+
+@test("a replacement holding the query is not replaced again, and case can be made to matter")
+replace_edges()
+    var (dir, ed) = fixture("a A a\n")
+
+    ask(&ed, "a", "aa")
+    ed.handle(Type('a'))
+    ed.finish()
+    assert_eq(all(&ed), "aa aa aa\n")
+    assert_eq(ed.message, "Replaced 3")
+
+    key(&ed, CtrlZ)
+    key(&ed, CtrlR)
+    key(&ed, CtrlT)
+    assert(drawn(&ed).row(8).starts_with(" Replace (match case):"))
+    typed(&ed, "A")
+    key(&ed, Enter)
+    typed(&ed, "b")
+    search_key(&ed, Enter)
+    assert_eq(ed.selection(), Some((2, 3)))
+    ed.handle(Type('a'))
+    ed.finish()
+    assert_eq(all(&ed), "a b a\n")
+    assert_eq(ed.message, "Replaced 1")
+
+    // An empty replacement deletes.
+    ask(&ed, "a", "")
+    ed.handle(Type('a'))
+    ed.finish()
+    assert_eq(all(&ed), " b \n")
+    remove_dir_all(dir).unwrap()
+
+@test("replace-all in windows of a few bytes replaces matches across window edges, and Esc stops it as one step")
+replace_all_windows()
+    var (dir, ed) = fixture("abababab\nab")
+
+    ed.query.extend("ab".bytes)
+    ed.replacement.extend("x".bytes)
+    ed.start(ReplaceAll, false, 0)
+    while ed.busy() do ed.work(3)
+    assert_eq(all(&ed), "xxxx\nx")
+    assert_eq(ed.message, "Replaced 5")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abababab\nab")
+
+    ed.start(ReplaceAll, false, 0)
+    ed.work(4)
+    assert(ed.busy())
+    key(&ed, Esc)
+    assert(!ed.busy())
+    assert_eq(all(&ed), "xxabab\nab")
+    assert_eq(ed.message, "Replaced 2, then stopped")
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "abababab\nab")
+    remove_dir_all(dir).unwrap()
+
+@test("a replace of nothing found, or of an empty query, says so and changes nothing")
+replace_errors()
+    var (dir, ed) = fixture("abc\n")
+
+    key(&ed, CtrlR)
+    key(&ed, Enter)
+    assert(ed.prompt == Idle)
+    assert_eq(ed.message, "Nothing to find")
+
+    ask(&ed, "zzz", "y")
+    assert(ed.prompt == Idle)
+    assert_eq(ed.message, "Not found: zzz")
+
+    ask(&ed, "b", "y")
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+    assert(!ed.text.modified())
+    remove_dir_all(dir).unwrap()

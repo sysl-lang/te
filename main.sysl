@@ -1,11 +1,14 @@
 // `te [file]`: edits `file`, a new file of that name if there is none, or an unnamed buffer.
 //
 // Everything the editor decides is in `Editor` (`editor.sysl`), which draws into a `Grid`; this file
-// is the terminal: it turns termbox's events into `Input`, and copies the grid to the screen.
+// is the terminal: it turns termbox's events into `Input`, copies the grid to the screen, and sends
+// what the editor has for the terminal itself (OSC 52). While a search runs, it runs a step of it
+// whenever no key is waiting, so the screen stays live and Esc can stop it.
 
 import sysl.fs.Interrupted
 import sysl.text.char_from_u32
-import sh.sysl.termbox2.{Event, Keyboard, Resize, Mouse, UnknownEvent, Key, InputMode, init, shutdown, width, height, clear, set_cell, set_cursor, hide_cursor, present, poll_event, set_input_mode}
+import sysl.time.monotonic
+import sh.sysl.termbox2.{Event, Keyboard, Resize, Mouse, UnknownEvent, Key, InputMode, init, shutdown, width, height, clear, set_cell, set_cursor, hide_cursor, present, poll_event, peek_event, send, set_input_mode}
 
 main(args: []string) -> Result[unit, string]
     if args.len > 2 then return Err("usage: te [file]")
@@ -29,27 +32,37 @@ run(ed: *Editor) -> Result[unit, string]
 
     loop
         ed.render(&g)
-        show(g)
+        show(g, ed)
         if ed.done then return Ok(())
 
-        poll_event() match
-            Ok(ev) -> if input_of(ev) is Some(i) then ed.handle(i)
+        val next = if ed.busy() then peek_event(0) else poll_event().map(e -> Some(e))
+
+        next match
+            // A search the key started gets one step before the screen is drawn, so a search that
+            // is short (most are) never shows as running.
+            Ok(Some(ev)) -> if input_of(ev) is Some(i)
+                ed.clock = monotonic().us / 1000
+                ed.handle(i)
+                if ed.busy() then ed.work(search_step)
+            Ok(None) -> ed.work(search_step)
             Err(e) -> if e.errno() != Interrupted.code() then return Err(e.message())
 end run
 
 /** What an event asks the editor, if anything. */
 input_of(ev: Event) -> Option[Input] = ev.kind match
-    Keyboard -> if ev.ch != 0 then char_from_u32(ev.ch).map(c -> Type(c)) else Some(Press(ev.key, ev.ctrl()))
+    Keyboard -> if ev.ch != 0 then char_from_u32(ev.ch).map(c -> Type(c)) else Some(Press(ev.key, ev.ctrl(), ev.shift()))
     Resize -> Some(Resized(ev.w, ev.h))
     Mouse -> ev.key match
-        MouseLeft -> Some(Click(ev.x, ev.y))
+        MouseLeft -> Some(if ev.motion() then Drag(ev.x, ev.y) else Click(ev.x, ev.y))
         MouseWheelUp -> Some(Wheel(-3))
         MouseWheelDown -> Some(Wheel(3))
         _ -> None
     UnknownEvent -> None
 
-/** Copies the grid to termbox's back buffer and sends what changed. */
-show(g: Grid)
+/** Copies the grid to termbox's back buffer, adds what the editor has for the terminal itself, and
+ * sends what changed.
+ */
+show(g: Grid, ed: *Editor)
     clear().unwrap_or(())
     for y in 0..<g.h
         for x in 0..<g.w
@@ -58,5 +71,9 @@ show(g: Grid)
             if cell.ch != 0 then set_cell(x, y, cell.ch, cell.fg, cell.bg).unwrap_or(())
 
     if g.cursor is Some((x, y)) then set_cursor(x, y).unwrap_or(()) else hide_cursor().unwrap_or(())
+    if ed.outbox.len() > 0
+        send(ed.outbox.view()).unwrap_or(())
+        ed.outbox.clear()
+
     present().unwrap_or(())
 end show

@@ -1,0 +1,66 @@
+// Finding text in bytes, and handing text to the terminal's clipboard.
+//
+// **A search is over bytes, a window at a time.** The editor never asks for the whole text: it reads a
+// window of the text, looks for the needle in it, and moves on, so a search of a file of many
+// gigabytes is a run of short steps the screen stays live between. Matching ignores the case of the
+// ASCII letters unless asked not to; every other byte, and so every non-ASCII character, matches only
+// itself.
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{base64_string, Standard}
+
+/** The byte a case-blind match compares: an ASCII capital as its small letter. */
+fold(b: u8) -> u8 = if b >= u8('A') && b <= u8('Z') then b + 32 else b
+
+/** Whether `needle` is at `hay[i..]`, entirely. */
+match_at(hay: []const u8, i: usize, needle: []const u8, match_case: bool) -> bool
+    if i + needle.len > hay.len then return false
+
+    for k in 0..<needle.len
+        val a = hay[i + k]
+        val b = needle[k]
+
+        if a != b && (match_case || fold(a) != fold(b)) then return false
+
+    true
+
+/** The first match starting before `below`. */
+first_match(hay: []const u8, needle: []const u8, match_case: bool, below: usize) -> Option[usize]
+    for i in 0..<below
+        if match_at(hay, i, needle, match_case) then return Some(i)
+
+    None
+
+/** The last match starting before `below`. */
+last_match(hay: []const u8, needle: []const u8, match_case: bool, below: usize) -> Option[usize]
+    var i = below
+
+    while i > 0
+        i -= 1
+        if match_at(hay, i, needle, match_case) then return Some(i)
+
+    None
+
+/** The needle as it is compared: folded unless the case is to match. */
+prepared(needle: []const u8, match_case: bool) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for b in needle do out.push(if match_case then b else fold(b))
+    out
+
+/** How much text the system clipboard is sent. Terminals refuse or truncate an OSC 52 much longer
+ * than this, and a copy larger than it stays in te's own clipboard.
+ */
+const osc52_limit: u64 = 1 << 18
+
+/** OSC 52: the terminal sets its own machine's clipboard to `text`, which is how a copy reaches the
+ * reader's desktop over ssh. `c` names the clipboard, and BEL ends the sequence.
+ */
+osc52(text: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.push(0x1b)
+    out.extend("]52;c;".bytes)
+    out.extend(base64_string(text, Standard, true).bytes)
+    out.push(0x07)
+    out
