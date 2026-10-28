@@ -1,0 +1,849 @@
+@tests
+
+// Huge files: the line total counted between keys, Ctrl+End before it is known, lines too long to
+// walk, and a file that changes on disk while it is open. The text core is checked against a string
+// model; the editor against the screen it draws.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text, remove_file, set_modified, metadata, set_permissions, create}
+import sysl.math.{min, max}
+import sysl.rand.{Rng, rng}
+import sysl.text.{from_utf8, chars_of}
+import sysl.time.{monotonic, Instant}
+import sh.sysl.termbox2.{Key, REVERSE, YELLOW, wcwidth}
+
+private newlines_in(b: []const u8) -> u64
+    var n: u64 = 0
+
+    for x in b do if x == u8('\n') then n += 1
+    n
+
+/** A fresh directory holding `text` as `f.txt`, and the file's path. */
+private fixture(text: string) -> (string, string)
+    val dir = make_temp_dir("te-huge").unwrap()
+    val file = s"$dir/f.txt"
+
+    write_text(file, text).unwrap()
+    (dir, file)
+
+private all(t: Text) -> string = from_utf8(t.bytes(0, t.size()).view()).unwrap()
+
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false, false))
+
+private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true, false))
+
+private shift(ed: *Editor, k: Key) = ed.handle(Press(k, false, true))
+
+private typed(ed: *Editor, s: string)
+    for c in s.chars do ed.handle(Type(c))
+
+private drawn(ed: *Editor) -> Grid
+    var g = grid()
+
+    ed.render(&g)
+    g
+
+private millis_since(start: long) -> long = (monotonic().us - start) / 1000
+
+private spaces(n: u64) -> string
+    var out: Buf[u8] = buf()
+
+    for _ in 0..<n do out.push(u8(' '))
+    from_utf8(out.view()).unwrap()
+
+// ---- counting between keys ---------------------------------------------------------------------
+
+@test("counting a step at a time reads each piece once, never much more than a step, and ends at the true total")
+count_in_steps()
+    var r = rng(7, 1)
+    var model: Buf[u8] = buf()
+
+    for _ in 0..<20_000
+        val b = r.below(10)
+
+        model.push(if b == 0 then u8('\n') elif b == 1 then u8('\r') else u8('a') + u8(b))
+
+    val (dir, file) = fixture(from_utf8(model.view()).unwrap())
+    var t = open(file, 64).unwrap()
+    var floor: u64 = 1
+    var steps = 0
+
+    assert_eq(t.lines_at_least(), 1, "nothing is counted on opening")
+    loop
+        val before = t.scanned
+
+        if t.count_some(500) then break
+        assert(t.scanned - before <= 500 + 64, s"a step read ${t.scanned - before}")
+        steps += 1
+        assert(t.lines_at_least() >= floor, "the lower bound went down")
+        floor = t.lines_at_least()
+
+        // An edit between steps: what it splits keeps its count where it had one.
+        if steps % 7 == 0
+            val at = r.below(t.size())
+
+            t.insert(at, "x\ny".bytes)
+            val added = "x\ny".bytes
+
+            for i in 0..<added.len do model.insert(usize(at) + i, added[i])
+        elif steps % 11 == 0 && t.size() > 10
+            val at = r.below(t.size() - 5)
+
+            t.delete(at, 5)
+            for _ in 0..<5 do model.remove(usize(at))
+
+        assert(t.lines_at_least() <= newlines_in(model.view()) + 1, "the lower bound passed the total")
+
+    assert(steps > 10, s"only $steps steps")
+    assert(t.lines_known())
+    assert_eq(t.lines_at_least(), newlines_in(model.view()) + 1)
+
+    val read = t.scanned
+
+    assert_eq(t.line_count(), newlines_in(model.view()) + 1)
+    assert_eq(t.scanned, read, "the total was counted again")
+    remove_dir_all(dir).unwrap()
+end count_in_steps
+
+@test("one step of counting reads at most its budget and the piece it ends in")
+count_step_bound()
+    var text: Buf[u8] = buf()
+
+    for i in 0..<10_000 do text.extend(if i % 3 == 0 then "line\n".bytes else "ab".bytes)
+
+    val (dir, file) = fixture(from_utf8(text.view()).unwrap())
+    var t = open(file, 100).unwrap()
+    var last: u64 = 0
+
+    while !t.count_some(250)
+        assert(t.scanned - last <= 250 + 100, s"a step read ${t.scanned - last}")
+        last = t.scanned
+
+    assert_eq(t.scanned, t.size(), "every byte counted exactly once")
+    assert_eq(t.line_count(), newlines_in(text.view()) + 1)
+    assert(t.count_some(250), "a finished count stays finished")
+    assert_eq(t.scanned, t.size())
+    remove_dir_all(dir).unwrap()
+
+@test("an empty file and an empty budget: the first is counted at once, the second counts nothing")
+count_edges()
+    val (dir, file) = fixture("")
+    var t = open(file).unwrap()
+
+    assert(t.count_some(1))
+    assert_eq(t.line_count(), 1)
+    remove_dir_all(dir).unwrap()
+
+    val (d2, f2) = fixture("a\nb\nc\n")
+    var u = open(f2, 2).unwrap()
+
+    assert(!u.count_some(0))
+    assert_eq(u.scanned, 0)
+    assert_eq(u.lines_at_least(), 1)
+    assert(u.count_some(1 << 20))
+    assert_eq(u.lines_at_least(), 4)
+    remove_dir_all(d2).unwrap()
+
+@test("start_before finds the start of the line holding any offset, across pieces, without counting")
+start_before_model()
+    val text = "ab\ncd\r\n\n\nlong line here\nx"
+    val (dir, file) = fixture(text)
+    val t = open(file, 3).unwrap()
+
+    for at in 0..u64(text.bytes.len)
+        var want = at
+
+        while want > 0 && text.bytes[usize(want - 1)] != u8('\n') do want -= 1
+        assert_eq(t.start_before(at), want, s"at $at")
+
+    assert_eq(t.scanned, 0)
+    remove_dir_all(dir).unwrap()
+
+// ---- the file on disk --------------------------------------------------------------------------
+
+@test("a file changed on disk is noticed by its size, its time or its inode, and a save or a reload makes it current")
+changed_on_disk()
+    val (dir, file) = fixture("one\n")
+    var t = open(file).unwrap()
+
+    assert(!t.changed_on_disk())
+    write_text(file, "one\ntwo\n").unwrap()
+    assert(t.changed_on_disk(), "a longer file")
+
+    t.insert(0, "zero\n".bytes)
+    t.save().unwrap()
+    assert(!t.changed_on_disk(), "a save is the file on disk")
+
+    // The same size, only the time moved.
+    set_modified(file, Instant(1_000_000_000_000_000)).unwrap()
+    assert(t.changed_on_disk(), "an older time")
+    assert(t.reload().is_ok())
+    assert(!t.changed_on_disk())
+
+    remove_file(file).unwrap()
+    assert(t.changed_on_disk(), "a file gone")
+    remove_dir_all(dir).unwrap()
+
+    val d2 = make_temp_dir("te-huge").unwrap()
+    val fresh = s"$d2/new.txt"
+    val n = empty(fresh)
+
+    assert(!n.changed_on_disk(), "a new file nobody has made")
+    write_text(fresh, "made by someone else").unwrap()
+    assert(n.changed_on_disk(), "a new file somebody made")
+    remove_dir_all(d2).unwrap()
+end changed_on_disk
+
+@test("a reload is the file as it is now, a version an undo goes back from, and a failed one changes nothing")
+reload_text()
+    val (dir, file) = fixture("a\nb\n")
+    var t = open(file, 2).unwrap()
+
+    t.insert(0, "mine ".bytes)
+    write_text(file, "a\nb\nc appended\n").unwrap()
+    assert(t.reload().is_ok())
+    assert_eq(all(t), "a\nb\nc appended\n")
+    assert(!t.modified())
+    assert_eq(t.line_count(), 4)
+    assert(t.undo())
+    assert_eq(all(t), "mine a\nb\n")
+    assert(t.modified())
+    assert(t.redo())
+    assert_eq(all(t), "a\nb\nc appended\n")
+
+    remove_file(file).unwrap()
+    assert(t.reload().is_err())
+    assert_eq(all(t), "a\nb\nc appended\n")
+    assert(!t.modified())
+    remove_dir_all(dir).unwrap()
+end reload_text
+
+// ---- Ctrl+End before the lines are counted -----------------------------------------------------
+
+/** Line `n` of a numbered fixture without its ending: the number, zero-padded to 12, and dots to
+ * `width` bytes.
+ */
+private numbered(n: u64, width: u64) -> string
+    val number = s"$n".bytes
+    var out: Buf[u8] = buf()
+
+    for _ in number.len..<12 do out.push(u8('0'))
+    out.extend(number)
+    for _ in 12..<width do out.push(u8('.'))
+    from_utf8(out.view()).unwrap()
+
+/** `lines` numbered lines of 100 bytes, each ending in LF or CRLF, then `tail`, in a fresh directory. */
+private numbered_file(lines: u64, crlf: bool, tail: string) -> (string, string)
+    val dir = make_temp_dir("te-huge").unwrap()
+    val file = s"$dir/big.txt"
+    val ending = if crlf then "\r\n" else "\n"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    for i in 0..<lines
+        chunk.extend(numbered(i, 100 - u64(ending.bytes.len)).bytes)
+        chunk.extend(ending.bytes)
+        if chunk.len() >= 1 << 20
+            f.write(chunk.view())
+            chunk.clear()
+
+    chunk.extend(tail.bytes)
+    f.write(chunk.view())
+    f.close().unwrap()
+    (dir, file)
+
+private opened_at(file: string, w: int, h: int) -> Editor
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(w, h))
+    ed
+
+private const big_lines: u64 = 200_000
+
+@test("Ctrl+End before the count is done goes to the end at once and shows the last lines, unnumbered, and Ln ≥ what is counted")
+far_end()
+    val (dir, file) = numbered_file(big_lines, false, "")
+    var ed = opened_at(file, 200, 10)
+
+    drawn(&ed)
+
+    val start = monotonic().us
+
+    ctrl(&ed, End)
+
+    var g = drawn(&ed)
+    val took = millis_since(start)
+
+    assert(ed.far)
+    assert_eq(ed.at, big_lines * 100)
+    assert(ed.text.scanned <= 6 << 20, s"Ctrl+End counted ${ed.text.scanned} bytes")
+    assert(took < 500, s"Ctrl+End took $took ms")
+
+    // The file ends in a newline, so its last line is empty and the cursor is at its start.
+    val gutter = ed.gutter()
+
+    for y in 0..<7
+        val n = big_lines - 7 + u64(y)
+
+        assert_eq(g.row(int(y)), spaces(gutter) + numbered(n, 99), s"row $y")
+
+    assert_eq(g.row(7), "")
+    assert_eq(g.cursor, Some((int(gutter), 7)))
+    assert(g.row(8).ends_with(s"Ln ≥ ${ed.text.lines_at_least()}, Col 1"), g.row(8))
+    assert(ed.text.lines_at_least() < big_lines, "the lower bound is what is counted, not the total")
+
+    // The counting between keys finishes the job, each step bounded, and the cursor learns its line.
+    var steps = 0
+    var slowest: long = 0
+
+    while ed.pending()
+        val before = ed.text.scanned
+        val t0 = monotonic().us
+
+        ed.work(search_step)
+        slowest = max(slowest, millis_since(t0))
+        assert(ed.text.scanned - before <= search_step + (1 << 20), s"a step counted ${ed.text.scanned - before}")
+        steps += 1
+
+    assert(steps >= 2)
+    assert(slowest < 200, s"a step of counting took $slowest ms")
+    assert(!ed.far)
+    assert_eq((ed.at, ed.line), (big_lines * 100, big_lines))
+    g = drawn(&ed)
+    assert(g.row(8).ends_with(s"Ln ${big_lines + 1} of ${big_lines + 1}, Col 1"), g.row(8))
+    assert_eq(g.row(7), s"${big_lines + 1}")
+    assert_eq(g.row(6), s"$big_lines ${numbered(big_lines - 1, 99)}")
+
+    // Once counted, Ctrl+Home and Ctrl+End read nothing more.
+    val counted = ed.text.scanned
+
+    ctrl(&ed, Home)
+    ctrl(&ed, End)
+    assert(!ed.far)
+    assert_eq((ed.at, ed.line), (big_lines * 100, big_lines))
+    assert_eq(ed.text.scanned, counted)
+    remove_dir_all(dir).unwrap()
+end far_end
+
+@test("a key that needs the line after a far Ctrl+End counts the rest then, and lands where it would have")
+far_settles()
+    val (dir, file) = numbered_file(big_lines, false, "")
+    var ed = opened_at(file, 40, 10)
+
+    ctrl(&ed, End)
+    assert(ed.far)
+    key(&ed, Up)
+    assert(!ed.far)
+    assert_eq((ed.at, ed.line), ((big_lines - 1) * 100, big_lines - 1))
+    assert_eq(ed.text.line_of(ed.at), ed.line)
+
+    // Typing at a far end is an edit at the end, on the right line, and an undo puts it back.
+    ctrl(&ed, End)
+    typed(&ed, "z")
+    assert_eq((ed.at, ed.line), (big_lines * 100 + 1, big_lines))
+    ed.handle(Press(CtrlZ, false, false))
+    assert_eq((ed.at, ed.line), (big_lines * 100, big_lines))
+    remove_dir_all(dir).unwrap()
+
+@test("a far screen keeps Esc, Ctrl+Home, a second Ctrl+End and a resize without counting, and Ctrl+Home leaves it")
+far_keeps()
+    val (dir, file) = numbered_file(big_lines, false, "")
+    var ed = opened_at(file, 40, 10)
+
+    ctrl(&ed, End)
+
+    // A second Ctrl+End counts one more step, as the first did; Esc and a resize count nothing.
+    val first = ed.text.scanned
+
+    ctrl(&ed, End)
+    assert(ed.text.scanned - first <= search_step + (1 << 20))
+
+    val read = ed.text.scanned
+
+    key(&ed, Esc)
+    ed.handle(Resized(40, 6))
+    assert(ed.far)
+    assert_eq(ed.text.scanned, read)
+    assert_eq(ed.far_rows.len(), 4)
+
+    var g = drawn(&ed)
+
+    assert_eq(g.row(3), "")
+    assert_eq(g.cursor, Some((int(ed.gutter()), 3)))
+
+    // Shift+Ctrl+Home from a far end selects everything, and knows its line: the first.
+    ed.handle(Press(Home, true, true))
+    assert(!ed.far)
+    assert_eq((ed.at, ed.line), (0, 0))
+    assert_eq(ed.selection(), Some((0, big_lines * 100)))
+    assert_eq(ed.text.scanned, read)
+    remove_dir_all(dir).unwrap()
+
+@test("a far screen over CRLF lines shows no CR, and a last line with no line break ends at the end")
+far_crlf()
+    val (dir, file) = numbered_file(60_000, true, "tail")
+    var ed = opened_at(file, 200, 6)
+
+    ctrl(&ed, End)
+    assert(ed.far)
+
+    val g = drawn(&ed)
+    val gutter = ed.gutter()
+
+    assert_eq(g.row(2), spaces(gutter) + numbered(59_999, 98))
+    assert_eq(g.row(3), spaces(gutter) + "tail")
+    assert_eq(g.cursor, Some((int(gutter + 4), 3)))
+    assert(g.row(4).ends_with(", Col 5"), g.row(4))
+    assert_eq(ed.far_line(2), (59_999 * 100, 59_999 * 100 + 98))
+    remove_dir_all(dir).unwrap()
+
+@test("a small file is counted by Ctrl+End's own step, so it never shows a far screen")
+far_never_small()
+    val (dir, file) = fixture("a\nb\nc")
+    var ed = opened_at(file, 40, 10)
+
+    ctrl(&ed, End)
+    assert(!ed.far)
+    assert_eq((ed.at, ed.line), (5, 2))
+    assert(!ed.pending())
+    remove_dir_all(dir).unwrap()
+
+// ---- opening -----------------------------------------------------------------------------------
+
+@test("a file of 64 MiB or more says its size on opening, and its first screen reads one piece")
+open_big_note()
+    val dir = make_temp_dir("te-huge").unwrap()
+    val file = s"$dir/big.txt"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    for i in 0..<(1 << 20) do chunk.push(if i % 80 == 79 then u8('\n') else u8('x'))
+    for _ in 0..<64 do f.write(chunk.view())
+    f.close().unwrap()
+
+    var ed = opened_at(file, 120, 10)
+    val g = drawn(&ed)
+
+    assert(g.row(8).starts_with(s" $file, 64 MiB (counting lines)"), g.row(8))
+    assert_eq(ed.text.scanned, 1 << 20)
+    assert(ed.pending())
+    remove_dir_all(dir).unwrap()
+
+    val (d2, small) = fixture("small\n")
+    var s = opened_at(small, 120, 10)
+
+    assert(drawn(&s).row(8).starts_with(s" $small"))
+    assert(!drawn(&s).row(8).contains("counting"))
+    remove_dir_all(d2).unwrap()
+
+@test("sizes are said in the largest unit they reach, gigabytes to a tenth")
+amounts()
+    assert_eq(amount(1), "1 byte")
+    assert_eq(amount(1023), "1023 bytes")
+    assert_eq(amount(64 << 20), "64 MiB")
+    assert_eq(amount(2 << 30), "2.0 GiB")
+    assert_eq(amount((3 << 30) / 2), "1.5 GiB")
+    assert_eq(amount((1 << 30) - 1), "1023 MiB")
+
+// ---- the file changing on disk -----------------------------------------------------------------
+
+@test("a save over a file that changed on disk asks first: N and Esc keep both, Y saves over it")
+save_changed()
+    val (dir, file) = fixture("ours\n")
+    var ed = opened_at(file, 100, 10)
+
+    typed(&ed, "x")
+    write_text(file, "theirs, appended\n").unwrap()
+
+    ctrl(&ed, CtrlS)
+    assert(ed.prompt == Overwriting)
+
+    var g = drawn(&ed)
+
+    assert(g.row(8).starts_with(" The file has changed on disk since it was opened. Save over it?"), g.row(8))
+    assert(g.row(9).starts_with("Y Save over it  N Don't save  Esc Cancel"), g.row(9))
+    typed(&ed, "n")
+    assert(ed.prompt == Idle)
+    assert_eq(read_text(file).unwrap(), "theirs, appended\n")
+    assert(ed.text.modified())
+    assert(drawn(&ed).row(8).starts_with(" Not saved "))
+
+    ed.handle(Press(CtrlS, false, false))
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+    assert_eq(ed.message, "Not saved")
+    assert_eq(read_text(file).unwrap(), "theirs, appended\n")
+
+    ed.handle(Press(CtrlS, false, false))
+    typed(&ed, "y")
+    assert_eq(read_text(file).unwrap(), "xours\n")
+    assert(!ed.text.modified())
+
+    // Saved, the file is ours again: the next save asks nothing.
+    typed(&ed, "y")
+    ed.handle(Press(CtrlS, false, false))
+    assert(ed.prompt == Idle)
+    assert_eq(read_text(file).unwrap(), "xyours\n")
+    remove_dir_all(dir).unwrap()
+end save_changed
+
+@test("quitting with changes over a file changed on disk asks both questions, and a failed save does not quit")
+quit_changed()
+    val (dir, file) = fixture("ours\n")
+    var ed = opened_at(file, 100, 10)
+
+    typed(&ed, "x")
+    write_text(file, "theirs\n").unwrap()
+    ed.handle(Press(CtrlQ, false, false))
+    typed(&ed, "y")
+    assert(ed.prompt == Overwriting)
+    assert(!ed.done)
+
+    // The directory is made read-only, so the save over it fails and the editor stays.
+    set_permissions(dir, 0o500).unwrap()
+    typed(&ed, "y")
+    set_permissions(dir, 0o700).unwrap()
+    assert(!ed.done)
+    assert(ed.message.starts_with("Could not save"), ed.message)
+    assert(ed.text.modified())
+    assert_eq(read_text(file).unwrap(), "theirs\n")
+
+    ed.handle(Press(CtrlQ, false, false))
+    typed(&ed, "y")
+    typed(&ed, "y")
+    assert(ed.done)
+    assert_eq(read_text(file).unwrap(), "xours\n")
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+L reloads the file as it is now, keeping the cursor's line and column; undo goes back; F5 too")
+reload_keys()
+    val (dir, file) = fixture("first\nsecond line\nthird\n")
+    var ed = opened_at(file, 40, 10)
+
+    key(&ed, Down)
+    key(&ed, End)
+    assert_eq((ed.at, ed.line), (17, 1))
+
+    write_text(file, "first\nsecond line, longer\nthird\nfourth, appended\n").unwrap()
+    ed.handle(Press(CtrlL, false, false))
+    assert_eq(all(ed.text), "first\nsecond line, longer\nthird\nfourth, appended\n")
+    assert_eq((ed.at, ed.line), (17, 1))
+    assert(!ed.text.modified())
+    assert_eq(ed.message, s"Reloaded $file")
+    assert_eq(drawn(&ed).row(3), "4 fourth, appended")
+
+    ed.handle(Press(CtrlZ, false, false))
+    assert_eq(all(ed.text), "first\nsecond line\nthird\n")
+    assert(ed.text.modified())
+
+    // A file cut shorter than the cursor's line puts it on the last line.
+    write_text(file, "only\n").unwrap()
+    key(&ed, F5)
+    assert_eq(all(ed.text), "only\n")
+    assert_eq((ed.at, ed.line), (5, 1))
+    remove_dir_all(dir).unwrap()
+
+@test("a reload of a file that is gone, or of a buffer with no file, says so and changes nothing")
+reload_fails()
+    val (dir, file) = fixture("kept\n")
+    var ed = opened_at(file, 60, 10)
+
+    remove_file(file).unwrap()
+    ed.handle(Press(CtrlL, false, false))
+    assert_eq(all(ed.text), "kept\n")
+    assert(ed.message.starts_with(s"Could not reload $file"), ed.message)
+    remove_dir_all(dir).unwrap()
+
+    var u = load("").unwrap()
+
+    u.handle(Resized(60, 10))
+    typed(&u, "abc")
+    u.handle(Press(CtrlL, false, false))
+    assert_eq(all(u.text), "abc")
+    assert_eq(u.message, "Nothing to reload: the text has no file")
+
+// ---- long lines --------------------------------------------------------------------------------
+
+/** Twenty bytes of everything a line can hold: ASCII, a tab, a two-byte letter, a wide CJK
+ * character, a letter with a combining mark, a four-byte wide emoji, and a space.
+ */
+private const motif = "ab\tcé中e\u{0301}😀xyz "
+
+/** `motif` enough times to make a long line. */
+private long_text(times: u64) -> string
+    var out: Buf[u8] = buf()
+
+    for _ in 0..<times do out.extend(motif.bytes)
+    from_utf8(out.view()).unwrap()
+
+/** Where each character of `line` starts, with the character. */
+private starts_of(line: string) -> Buf[(u64, char)]
+    var out: Buf[(u64, char)] = buf()
+    var cs = chars_of(line.bytes)
+    var off: u64 = 0
+
+    while cs.next() is Some(c)
+        out.push((off, c))
+        off = u64(cs.offset)
+
+    out
+
+/** The model of a long line on screen: what the cells from byte column `left`, `width` of them, show
+ * when every byte is a column, a character's glyph is in its first and its marks join the glyph
+ * before them.
+ */
+private long_row(line: string, left: u64, width: u64) -> string
+    var cells: Buf[string] = buf()
+    var last: i64 = -1
+
+    for _ in 0..<width do cells.push(" ")
+    for (off, c) in starts_of(line)
+        val w = if c == '\t' then 1 elif wcwidth(u32(c)) < 0 then 1 else u64(wcwidth(u32(c)))
+        val glyph = if c == '\t' then " " else string(c)
+
+        if w > 0 && off >= left && off + w <= left + width
+            cells.set(usize(off - left), glyph)
+            for i in 1..<w do cells.set(usize(off - left + i), "")
+            last = i64(off - left)
+        elif w == 0 && last >= 0
+            cells.set(usize(last), cells[usize(last)] + glyph)
+        else
+            last = -1
+
+    var out = ""
+
+    for cell in cells.view() do out = out + cell
+    out.trim_end()
+end long_row
+
+/** Where the cursor can stop on `line`: every character but a combining mark, and the end. */
+private stops_of(line: string) -> Buf[u64]
+    var out: Buf[u64] = buf()
+
+    for (off, c) in starts_of(line) do if c == '\t' || wcwidth(u32(c)) != 0 then out.push(off)
+    out.push(u64(line.bytes.len))
+    out
+
+@test("a long line is drawn a byte to a column, against a model, wherever the view is scrolled to")
+long_drawn()
+    val line = long_text(2000)
+    val len = u64(line.bytes.len)
+    val (dir, file) = fixture(s"short\n$line\nend")
+    var ed = opened_at(file, 160, 10)
+    val gutter: u64 = 2
+    val targets: []const u64 = [1, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 30_001, 30_007, 30_011, 39_995, 40_000, 40_001, 50_000]
+
+    for target in targets
+        ctrl(&ed, CtrlG)
+        typed(&ed, s"2:$target")
+        key(&ed, Enter)
+
+        // A column inside a character is that character, and one on a mark the letter it is on.
+        var want = min(target - 1, len)
+
+        while want < len && (line.bytes[usize(want)] & 0xC0) == 0x80 do want -= 1
+        if want < len && want % 20 == 10 then want -= 1
+        assert_eq(ed.at, 6 + want, s"2:$target")
+
+        val g = drawn(&ed)
+
+        assert_eq(g.row(1), "2 " + long_row(line, ed.left, 160 - gutter), s"2:$target, from ${ed.left}")
+        assert_eq(g.cursor, Some((int(gutter + ed.at - 6 - ed.left), 1)))
+        assert(g.row(8).ends_with(s"Ln 2 of 3, Byte ${ed.at - 6 + 1}"), g.row(8))
+
+    remove_dir_all(dir).unwrap()
+end long_drawn
+
+@test("on a long line, Right and Left step a character and its marks at a time, Up and Down keep the byte column")
+long_moves()
+    val line = long_text(2000)
+    val stops = stops_of(line)
+    val (dir, file) = fixture(s"short\n$line\nend")
+    var ed = opened_at(file, 60, 10)
+
+    key(&ed, Down)
+    key(&ed, Home)
+    assert_eq(ed.at, 6)
+
+    for i in 1..300
+        key(&ed, Right)
+        assert_eq(ed.at - 6, stops[i], s"right to stop $i")
+
+    var i: usize = 300
+
+    while i > 0
+        i -= 1
+        key(&ed, Left)
+        assert_eq(ed.at - 6, stops[i], s"left to stop $i")
+
+    // From the far end, back over the last characters.
+    key(&ed, End)
+
+    var j = stops.len() - 1
+
+    for _ in 0..<20
+        key(&ed, Left)
+        j -= 1
+        assert_eq(ed.at - 6, stops[j])
+
+    key(&ed, Home)
+
+    // Down from column 3 of the short line lands on byte 3, and Up from byte 37 on the short line's end.
+    key(&ed, Up)
+    key(&ed, Right)
+    key(&ed, Right)
+    key(&ed, Right)
+    key(&ed, Down)
+    assert_eq((ed.at, ed.line), (9, 1))
+    ctrl(&ed, CtrlG)
+    typed(&ed, "2:38")
+    key(&ed, Enter)
+    key(&ed, Up)
+    assert_eq((ed.at, ed.line), (5, 0))
+
+    // End and the line after: the goal is a byte column past the short last line's end.
+    key(&ed, Down)
+    key(&ed, End)
+    assert_eq(ed.at, 6 + u64(line.bytes.len))
+    key(&ed, Down)
+    assert_eq((ed.at, ed.line), (6 + u64(line.bytes.len) + 4, 2))
+    key(&ed, Up)
+    assert_eq(ed.at, 6 + u64(line.bytes.len))
+    remove_dir_all(dir).unwrap()
+end long_moves
+
+@test("matches on a long line are lit where they are, however far along the view is")
+long_hits()
+    val line = long_text(2000)
+    val (dir, file) = fixture(s"short\n$line\n")
+    var ed = opened_at(file, 60, 10)
+
+    ctrl(&ed, CtrlF)
+    typed(&ed, "xyz")
+    ed.finish()
+    key(&ed, Esc)
+    key(&ed, Right)
+    ctrl(&ed, CtrlG)
+    typed(&ed, "2:30001")
+    key(&ed, Enter)
+
+    val g = drawn(&ed)
+    var lit = 0
+
+    for x in 2..<60
+        val col = ed.left + u64(x - 2)
+        val inside = col % 20 >= 16 && col % 20 < 19
+        val cell = g.at(int(x), 1)
+
+        assert_eq(cell.bg == YELLOW, inside, s"column $col")
+        if inside then lit += 1
+
+    assert(lit >= 6)
+    remove_dir_all(dir).unwrap()
+
+@test("a 50 MB line with no line break: every move and every frame is bounded, whatever the column")
+long_bounded()
+    val dir = make_temp_dir("te-huge").unwrap()
+    val file = s"$dir/one.txt"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    for i in 0..<(1 << 20) do chunk.push(if i % 64 == 63 then u8(' ') else u8('a'))
+    for _ in 0..<50 do f.write(chunk.view())
+    f.close().unwrap()
+
+    val size: u64 = 50 << 20
+    var ed = opened_at(file, 200, 10)
+
+    drawn(&ed)
+
+    // Finding the line's end counts the file once; after that, nothing walks the line.
+    key(&ed, End)
+    assert_eq(ed.at, size)
+
+    val start = monotonic().us
+    var g = drawn(&ed)
+
+    for _ in 0..<200
+        key(&ed, Left)
+        g = drawn(&ed)
+
+    assert_eq(ed.at, size - 200)
+    assert_eq(g.cursor, Some((int(ed.gutter() + size - 200 - ed.left), 0)))
+    assert(g.row(8).ends_with(s"Byte ${size - 200 + 1}"), g.row(8))
+
+    for _ in 0..<100
+        ctrl(&ed, Left)
+        drawn(&ed)
+
+    ctrl(&ed, CtrlG)
+    typed(&ed, "1:25000001")
+    key(&ed, Enter)
+    g = drawn(&ed)
+    assert_eq(ed.at, 25_000_000)
+    assert(g.row(0).contains("aaa a"), g.row(0))
+    for _ in 0..<5 do shift(&ed, Right)
+    assert_eq(ed.selection(), Some((25_000_000, 25_000_005)))
+    assert_eq(drawn(&ed).at(int(ed.gutter() + 25_000_000 - ed.left), 0).fg & REVERSE, REVERSE)
+
+    // An edit near the end of the line, and its undo.
+    key(&ed, End)
+    for _ in 0..<10 do key(&ed, Left)
+    typed(&ed, "Z")
+    g = drawn(&ed)
+    assert_eq(ed.text.byte_at(size - 10), u8('Z'))
+    assert_eq(g.cursor, Some((int(ed.gutter() + size - 9 - ed.left), 0)))
+    ed.handle(Press(CtrlZ, false, false))
+    assert_eq(ed.text.size(), size)
+    assert_eq(ed.at, size - 10)
+
+    val took = millis_since(start)
+
+    assert(took < 3000, s"a few hundred keys on a 50 MB line took $took ms")
+    remove_dir_all(dir).unwrap()
+end long_bounded
+
+@test("a word move on a line of one long word stops after a bounded distance, both ways")
+long_word()
+    var word: Buf[u8] = buf()
+
+    for _ in 0..<100_000 do word.push(u8('w'))
+
+    val (dir, file) = fixture(from_utf8(word.view()).unwrap())
+    var ed = opened_at(file, 80, 10)
+
+    ctrl(&ed, Right)
+    assert_eq(ed.at, 1 << 15)
+    ctrl(&ed, Right)
+    assert_eq(ed.at, 2 << 15)
+    ctrl(&ed, Left)
+    assert_eq(ed.at, 1 << 15)
+    ctrl(&ed, Left)
+    assert_eq(ed.at, 0)
+
+    // A double click selects at most that far either side.
+    ctrl(&ed, CtrlG)
+    typed(&ed, "1:50001")
+    key(&ed, Enter)
+    ed.select_word()
+    assert_eq(ed.selection(), Some((50_000 - (1 << 15), 50_000 + (1 << 15))))
+    remove_dir_all(dir).unwrap()
+
+@test("a line one byte over the limit is laid out by bytes, one at the limit by cells")
+long_threshold()
+    var at_limit: Buf[u8] = buf()
+
+    at_limit.push(u8('\t'))
+    for _ in 1..<(1 << 15) do at_limit.push(u8('a'))
+
+    val (dir, file) = fixture(from_utf8(at_limit.view()).unwrap() + "\n\t" + from_utf8(at_limit.view()).unwrap())
+    var ed = opened_at(file, 200, 10)
+
+    key(&ed, End)
+    assert_eq(ed.column(0, ed.at), ((1 << 15) - 1 + 4, (1 << 15)))
+    assert(drawn(&ed).row(8).ends_with(s"Col ${(1 << 15) + 1}"))
+    key(&ed, Down)
+    key(&ed, End)
+    assert_eq(ed.column(1, ed.at), ((1 << 15) + 1, (1 << 15) + 1))
+    assert(drawn(&ed).row(8).ends_with(s"Byte ${(1 << 15) + 2}"))
+    remove_dir_all(dir).unwrap()

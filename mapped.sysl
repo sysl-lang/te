@@ -22,12 +22,15 @@ c const
     MAP_PRIVATE: int = "MAP_PRIVATE"
     O_RDONLY: int    = "O_RDONLY"
     SEEK_END: int    = "SEEK_END"
+    MADV_DONTNEED: int = "MADV_DONTNEED"
 
 private extern "open" c_open(path: *u8, flags: int) -> int
 private extern "close" c_close(fd: int) -> int
 private extern "lseek" c_lseek(fd: int, offset: i64, whence: int) -> i64
 private extern "mmap" c_mmap(addr: *u8, len: usize, prot: int, flags: int, fd: int, offset: i64) -> *u8
 private extern "munmap" c_munmap(addr: *u8, len: usize) -> int
+private extern "madvise" c_madvise(addr: *u8, len: usize, advice: int) -> int
+private extern "getpagesize" c_getpagesize() -> int
 
 #if bsd
 private extern "__error" errno_location() -> *i32
@@ -46,6 +49,22 @@ struct Mapping
 
     /** The whole file. */
     bytes(self) -> []const u8 = if self.size == 0 then [] else self.at[0..<usize(self.size)]
+
+    /** Tells the kernel the whole pages inside `from..<from + len` are not needed for now, so reading
+     * through a file of many gigabytes once -- counting its lines -- does not leave all of it in the
+     * process's resident set. The bytes are the file's and never written, so a later read faults them
+     * back in from the page cache, unchanged.
+     *
+     * Linux drops the pages from the mapping. macOS takes the advice and keeps them mapped: there the
+     * resident size `ps` reports grows to the bytes read, every one of them a clean page of the file
+     * that the kernel reclaims whenever it needs the memory, and the process's footprint does not grow.
+     */
+    release(self, from: u64, len: u64)
+        val page = u64(c_getpagesize())
+        val lo = (from + page - 1) / page * page
+        val hi = (from + len) / page * page
+
+        if hi > lo then c_madvise(&self.at[usize(lo)], usize(hi - lo), MADV_DONTNEED)
 
 impl Drop for Mapping
     drop(self)

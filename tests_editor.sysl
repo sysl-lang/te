@@ -409,7 +409,7 @@ ed_status()
 
     assert(g.row(8).starts_with(s" $name"))
     assert(g.row(8).ends_with("Ln 1 of 3, Col 1"), "a file the first screen reaches the end of has its total")
-    assert_eq(g.row(9), "^S Save  ^Q Quit  ^F Find  ^R Replace  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^G Go to line")
+    assert_eq(g.row(9), "^S Save  ^Q Quit  ^F Find  ^R Replace  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^G Go to line  ^L Reload")
     assert_eq(g.at(0, 9).fg & REVERSE, REVERSE)
 
     key(&ed, Down)

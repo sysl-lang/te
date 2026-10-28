@@ -46,8 +46,18 @@ const streak_pause: long = 1000
 /** How soon, in milliseconds, a second click in the same place is a double click. */
 const double_click: long = 400
 
-/** How much of the text a search reads in one step between keys. */
+/** How much of the text a search reads, or the line counting counts, in one step between keys. */
 const search_step: u64 = 4 << 20
+
+/** How long a line may be, in bytes, and still be laid out cell by cell. A longer one -- a minified
+ * file, a log with no line breaks -- is laid out a byte to a column, so where the cursor is on screen
+ * is a subtraction and nothing walks the line from its start; the status bar says `Byte` there in
+ * place of `Col`. A word move goes no further than this either.
+ */
+const long_line: u64 = 1 << 15
+
+/** A file this large or larger has its size said when it is opened. */
+const big_file: u64 = 64 << 20
 
 /** What the editor is told: the terminal's input, already named. */
 enum Input
@@ -83,6 +93,8 @@ enum Prompt
     ReplacingWith
     /** Whether to replace the match selected. */
     Confirming
+    /** Whether to save over a file that has changed on disk since it was opened. */
+    Overwriting
 
 /** A cursor: its offset and the line it is on. */
 type Spot = (u64, u64)
@@ -197,6 +209,14 @@ struct Editor
     /** How many bytes searches have read. */
     searched: u64
 
+    /** Set when Ctrl+End went to the end before the lines were counted: the cursor is at the end, its
+     * line is not known, and the screen shows the lines `far_rows` start at, found by reading back from
+     * the end. It ends when the counting does, or at a key that needs the cursor's line, which then
+     * counts the rest at once.
+     */
+    far: bool
+    far_rows: Buf[u64]
+
     // ---- layout ------------------------------------------------------------------------------
 
     /** The number of text rows: the screen less the status bar and the key bar. */
@@ -204,7 +224,12 @@ struct Editor
 
     /** The gutter's width: the digits of the last line number it may show, and a space. */
     gutter(*self) -> u64
-        val last = if self.text.lines_known() then self.text.line_count() else self.top + self.rows()
+        val last = if self.text.lines_known() then
+            self.text.line_count()
+        elif self.far then
+            self.text.lines_at_least()
+        else
+            self.top + self.rows()
 
         digits(last) + 1
 
@@ -235,9 +260,22 @@ struct Editor
 
         first_char(self.text.bytes(at, min(at + 4, self.text.size())).view())
 
+    /** Where line `line`'s text starts and ends. */
+    bounds(*self, line: u64) -> (u64, u64) = (self.text.line_start(line), self.text.line_end(line))
+
     /** The screen column of `at` on line `line`, and its column in characters. */
     column(*self, line: u64, at: u64) -> (u64, u64)
-        var off = self.text.line_start(line)
+        val (start, end) = self.bounds(line)
+
+        self.column_in(start, end, at)
+
+    /** The screen column of `at` on the line whose text is `start..<end`, and its column in
+     * characters; on a long line, both are bytes from the start.
+     */
+    column_in(*self, start: u64, end: u64, at: u64) -> (u64, u64)
+        if end - start > long_line then return (at - start, at - start)
+
+        var off = start
         var col: u64 = 0
         var chars: u64 = 0
 
@@ -249,14 +287,29 @@ struct Editor
             off += len
 
         (col, chars)
-    end column
+    end column_in
 
     /** The offset on line `line` nearest screen column `goal` without passing it: a column inside a
      * tab or a wide character is the start of it.
      */
     at_column(*self, line: u64, goal: u64) -> u64
-        val end = self.text.line_end(line)
-        var off = self.text.line_start(line)
+        val (start, end) = self.bounds(line)
+
+        self.at_column_in(start, end, goal)
+
+    /** `at_column` on the line whose text is `start..<end`. On a long line a column is a byte, and one
+     * inside a character or on a combining mark is the start of the character the mark is on.
+     */
+    at_column_in(*self, start: u64, end: u64, goal: u64) -> u64
+        if end - start > long_line
+            if goal >= end - start then return end
+
+            var at = self.text.char_start(start + goal)
+
+            while at > start && is_mark(self.char_at(at).0) do at = self.text.char_start(at - 1)
+            return at
+
+        var off = start
         var col: u64 = 0
 
         while off < end
@@ -268,7 +321,7 @@ struct Editor
             off += len
 
         off
-    end at_column
+    end at_column_in
 
     /** Past the character at `at` and the combining marks after it. */
     cluster_end(*self, at: u64, end: u64) -> u64
@@ -286,8 +339,8 @@ struct Editor
 
     /** Where line `line`'s indentation ends. */
     indent_end(*self, line: u64) -> u64
-        val end = self.text.line_end(line)
         var off = self.text.line_start(line)
+        val end = min(self.text.line_end(line), off + long_line)
 
         while off < end && is_blank(self.text.byte_at(off)) do off += 1
         off
@@ -298,6 +351,7 @@ struct Editor
         self.at = at
         self.line = line
         self.goal = None
+        self.far = false
 
     left_one(*self)
         val start = self.text.line_start(self.line)
@@ -320,10 +374,11 @@ struct Editor
 
         if self.at <= start then return self.left_one()
 
+        val stop = max(start, self.at - min(self.at, long_line))
         var off = self.at
 
-        while off > start && !is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
-        while off > start && is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
+        while off > stop && !is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
+        while off > stop && is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
         self.place(off, self.line)
     end word_left
 
@@ -332,10 +387,11 @@ struct Editor
 
         if self.at >= end then return self.right_one()
 
+        val stop = min(end, self.at + long_line)
         var off = self.at
 
-        while off < end && !is_word(self.char_at(off).0) do off += self.char_at(off).1
-        while off < end && is_word(self.char_at(off).0) do off += self.char_at(off).1
+        while off < stop && !is_word(self.char_at(off).0) do off += self.char_at(off).1
+        while off < stop && is_word(self.char_at(off).0) do off += self.char_at(off).1
         self.place(off, self.line)
     end word_right
 
@@ -375,15 +431,79 @@ struct Editor
 
         self.place(if self.at != indent then indent else self.text.line_start(self.line), self.line)
 
-    /** Line `n` (from 0), or the last line for one past it, at character column `col`, shown in the
-     * middle of the screen.
+    /** Line `n` (from 0), or the last line for one past it, at character column `col` -- a byte on a
+     * long line -- shown in the middle of the screen.
      */
     goto(*self, n: u64, col: u64)
         val line = if self.has_line(n) then n else self.last_line()
         val half = self.rows() / 2
+        val (start, end) = self.bounds(line)
+        val at = if end - start > long_line then self.at_column_in(start, end, col) else self.text.offset_at(line, col)
 
-        self.place(self.text.offset_at(line, col), line)
+        self.place(at, line)
         self.top = if line > half then line - half else 0
+
+    /** Ctrl+End: the end of the text. Where the lines are not all counted after one more step of
+     * counting, the cursor goes to the end without its line (`far`), and the screen shows the lines
+     * before it, read back from the end.
+     */
+    to_end(*self)
+        if self.text.lines_known() || self.text.count_some(search_step) then return self.place(self.text.size(), self.last_line())
+
+        self.at = self.text.size()
+        self.goal = None
+        self.far = true
+        self.line = self.text.lines_at_least() - 1
+        self.frame_far()
+
+    /** The starts of the last lines of the text, as many as fit on the screen, top first. */
+    frame_far(*self)
+        var starts: Buf[u64] = buf()
+        var s = self.text.start_before(self.text.size())
+
+        loop
+            starts.push(s)
+            if s == 0 || u64(starts.len()) >= self.rows() then break
+            s = self.text.start_before(s - 1)
+
+        self.far_rows.clear()
+        while starts.pop() is Some(x) do self.far_rows.push(x)
+
+    /** Where the text of the `i`th line on a `far` screen starts and ends. */
+    far_line(*self, i: usize) -> (u64, u64)
+        val start = self.far_rows[i]
+
+        if i + 1 == self.far_rows.len() then return (start, self.text.size())
+
+        val next = self.far_rows[i + 1] - 1
+
+        (start, if next > start && self.text.byte_at(next - 1) == u8('\r') then next - 1 else next)
+
+    /** Where the text of the cursor's line starts and ends. */
+    cursor_line(*self) -> (u64, u64) = if self.far then self.far_line(self.far_rows.len() - 1) else self.bounds(self.line)
+
+    /** The cursor's line found, after a `far` Ctrl+End: free once the lines are counted, and otherwise
+     * the rest of them counted now.
+     */
+    settle(*self)
+        if !self.far then return
+
+        self.far = false
+        self.line = self.text.line_count() - 1
+        self.follow()
+
+    /** Keys that need no line for the cursor, which a `far` cursor keeps: to either end, Esc, saving
+     * and quitting, and the answers to the save and quit prompts.
+     */
+    stays_far(self, input: Input) -> bool
+        if self.prompt == Quitting || self.prompt == Naming || self.prompt == Overwriting then return true
+
+        input match
+            Press(key, ctrl, _) -> key match
+                Home | End -> ctrl
+                Esc | CtrlS | CtrlQ -> true
+                _ -> false
+            _ -> false
 
     // ---- editing -----------------------------------------------------------------------------
 
@@ -577,8 +697,11 @@ struct Editor
         var to = self.cluster_end(self.at, end)
 
         if is_word(self.char_at(self.at).0)
-            while from > start && is_word(self.char_at(self.text.char_start(from - 1)).0) do from = self.text.char_start(from - 1)
-            while to < end && is_word(self.char_at(to).0) do to += self.char_at(to).1
+            val lo = max(start, self.at - min(self.at, long_line))
+            val hi = min(end, self.at + long_line)
+
+            while from > lo && is_word(self.char_at(self.text.char_start(from - 1)).0) do from = self.text.char_start(from - 1)
+            while to < hi && is_word(self.char_at(to).0) do to += self.char_at(to).1
 
         self.anchor = Some(from)
         self.place(to, self.line)
@@ -681,9 +804,26 @@ struct Editor
         self.lit = true
         self.hunt = Some(Hunt(goal, back, from, limit, from, goal == ReplaceAll, 0, 0, self.text.now, self.at))
 
-    /** Looks through up to `budget` more bytes for the search in progress. */
-    work(*self, budget: u64)
-        if self.hunt is Some(h) then self.step(h, budget)
+    /** Whether there is work to do between keys: a search, or lines still to count. */
+    pending(self) -> bool = self.busy() || !self.text.lines_known()
+
+    /** Looks through up to `budget` more bytes for the search in progress, or with none, counts up to
+     * `budget` more bytes of lines; a `far` cursor learns its line once they are all counted. True
+     * when the screen may show something new: a search's progress, the line total once it is known,
+     * the lines a `far` cursor is at least on.
+     */
+    work(*self, budget: u64) -> bool
+        if self.hunt is Some(h)
+            self.step(h, budget)
+            return true
+
+        val far = self.far
+
+        if self.text.count_some(budget)
+            self.settle()
+            return true
+
+        far
 
     /** Runs the search in progress to its end. */
     finish(*self)
@@ -828,14 +968,41 @@ struct Editor
 
     // ---- saving and quitting -----------------------------------------------------------------
 
-    /** Saves to the document's name, or asks for one; true when the text is now on disk. */
+    /** Saves to the document's name, or asks for one, or asks first when the file has changed on disk
+     * since it was opened, saved or reloaded; true when the text is now on disk.
+     */
     save(*self) -> bool
         if self.text.path.len == 0
             self.prompt = Naming
             self.entry.clear()
             return false
 
+        if self.text.changed_on_disk()
+            self.prompt = Overwriting
+            return false
+
         self.save_as(self.text.path)
+
+    /** Ctrl+L: the file as it is on disk now, as a new version an undo goes back from, with the cursor
+     * kept on its line and column where the file still has them.
+     */
+    reload(*self)
+        if self.text.path.len == 0
+            self.message = "Nothing to reload: the text has no file"
+            return
+
+        val before = (self.at, self.line)
+        val col = self.column(self.line, self.at).0
+
+        if self.text.reload() is Err(e)
+            self.message = s"Could not reload ${self.text.path}: $e"
+            return
+
+        val line = if self.has_line(self.line) then self.line else self.last_line()
+
+        self.place(self.at_column(line, col), line)
+        self.edited(before)
+        self.message = s"Reloaded ${self.text.path}"
 
     save_as(*self, path: string) -> bool = self.text.save_as(path) match
         Ok(_) ->
@@ -855,7 +1022,10 @@ struct Editor
         if input is Resized(w, h)
             self.w = w
             self.h = h
+            if self.far then self.frame_far()
             return self.follow()
+
+        if self.far && !self.stays_far(input) then self.settle()
 
         self.message = ""
         self.last_streak = self.streak
@@ -907,7 +1077,7 @@ struct Editor
                 if ctrl then self.place(0, 0) else self.home()
             End ->
                 self.extend(shift)
-                if ctrl then self.place(self.text.size(), self.last_line()) else self.place(self.text.line_end(self.line), self.line)
+                if ctrl then self.to_end() else self.place(self.text.line_end(self.line), self.line)
             Enter -> self.enter()
             Tab -> self.type_char('\t')
             Space -> self.type_char(' ')
@@ -927,6 +1097,7 @@ struct Editor
             CtrlY -> self.redo()
             CtrlS -> self.save()
             CtrlQ -> self.quit()
+            CtrlL | F5 -> self.reload()
             CtrlG ->
                 self.prompt = GoingTo
                 self.entry.clear()
@@ -945,6 +1116,24 @@ struct Editor
                     elif c == 'n' || c == 'N'
                         self.done = true
                 Press(key, _, _) -> if key == Esc || key == CtrlC || key == CtrlQ then self.prompt = Idle
+                _ -> ()
+            return
+
+        if self.prompt == Overwriting
+            input match
+                Type(c) ->
+                    if c == 'y' || c == 'Y'
+                        self.prompt = Idle
+                        if self.save_as(self.text.path) && self.quit_after then self.done = true
+                        self.quit_after = false
+                    elif c == 'n' || c == 'N'
+                        self.prompt = Idle
+                        self.quit_after = false
+                        self.message = "Not saved"
+                Press(key, _, _) -> if key == Esc || key == CtrlC || key == CtrlQ
+                    self.prompt = Idle
+                    self.quit_after = false
+                    self.message = "Not saved"
                 _ -> ()
             return
 
@@ -1088,12 +1277,15 @@ struct Editor
     follow(*self)
         val rows = self.rows()
 
-        if self.line < self.top then
-            self.top = self.line
-        elif self.line >= self.top + rows then
-            self.top = self.line - rows + 1
+        // A `far` screen is the last lines of the text, whatever `top` says.
+        if !self.far
+            if self.line < self.top then
+                self.top = self.line
+            elif self.line >= self.top + rows then
+                self.top = self.line - rows + 1
 
-        val col = self.column(self.line, self.at).0
+        val (start, end) = self.cursor_line()
+        val col = self.column_in(start, end, self.at).0
         val width = self.text_width()
 
         if col < self.left then
@@ -1111,48 +1303,63 @@ struct Editor
         val gutter = self.gutter()
         val width = self.text_width()
 
-        for y in 0..<rows
-            val n = self.top + y
+        // A `far` screen's lines have no numbers yet, so none are shown.
+        if self.far
+            for i in 0..<self.far_rows.len()
+                val (start, end) = self.far_line(i)
 
-            if !self.has_line(n) then break
+                self.draw_line(g, start, end, int(i), gutter, width)
+        else
+            for y in 0..<rows
+                val n = self.top + y
 
-            val label = s"${n + 1}"
+                if !self.has_line(n) then break
 
-            g.write(int(gutter - 1 - label.len), int(y), label, DIM, DEFAULT)
-            self.draw_line(g, n, int(y), gutter, width)
+                val label = s"${n + 1}"
+                val (start, end) = self.bounds(n)
+
+                g.write(int(gutter - 1 - label.len), int(y), label, DIM, DEFAULT)
+                self.draw_line(g, start, end, int(y), gutter, width)
 
         if self.h > 1 then self.status(g, int(rows))
         if self.h > 2 then self.keys(g, int(rows) + 1)
 
         if self.typing_in_prompt() then return
 
-        val (col, _) = self.column(self.line, self.at)
+        val (start, end) = self.cursor_line()
+        val (col, _) = self.column_in(start, end, self.at)
+        val row = if self.far then u64(self.far_rows.len() - 1) else self.line - min(self.line, self.top)
 
-        if self.line >= self.top && self.line < self.top + rows && col >= self.left && col < self.left + width
-            g.cursor = Some((int(gutter + col - self.left), int(self.line - self.top)))
+        if (self.far || self.line >= self.top) && row < rows && col >= self.left && col < self.left + width
+            g.cursor = Some((int(gutter + col - self.left), int(row)))
     end render
 
     /** Whether the reader is typing into the status bar, which then has the cursor. */
     typing_in_prompt(self) -> bool =
         self.prompt == GoingTo || self.prompt == Naming || self.prompt == Finding || self.prompt == Replacing || self.prompt == ReplacingWith
 
-    /** Line `n`, the part of it in view. The selection is drawn reversed, a selected line break as one
-     * reversed cell after the text, and the query's matches black on yellow.
+    /** The line whose text is `start..<end`, the part of it in view. The selection is drawn reversed,
+     * a selected line break as one reversed cell after the text, and the query's matches black on
+     * yellow.
+     *
+     * **A long line is drawn a byte to a column** (`long_line`), so drawing starts at the first byte in
+     * view rather than at the line's start: a character takes as many columns as it has bytes, its
+     * glyph in the first of them and blanks after, and a tab is one column.
      */
-    draw_line(*self, g: *Grid, n: u64, y: int, gutter: u64, width: u64)
-        val end = self.text.line_end(n)
+    draw_line(*self, g: *Grid, start: u64, end: u64, y: int, gutter: u64, width: u64)
+        val long = end - start > long_line
         val stop = self.left + width
-        val start = self.text.line_start(n)
         val (from, to) = self.selection().unwrap_or((0, 0))
-        val hits = self.hits(n, start, end, stop)
+        var off = if long then self.text.char_start(min(start + self.left, end)) else start
+        val hits = self.hits(start, off, end, if long then min(end, start + stop) else self.at_column_in(start, end, stop))
         var h: usize = 0
-        var off = start
-        var col: u64 = 0
+        var col = off - start
         var last = -1
 
         while off < end && col < stop
             val (c, len) = self.char_at(off)
-            val span = cells(c, col, self.tab)
+            val span = if long then len else cells(c, col, self.tab)
+            val shown = if long && c != '\t' then cells(c, 0, self.tab) else span
 
             while h < hits.len() && hits[h].1 <= off do h += 1
 
@@ -1166,37 +1373,47 @@ struct Editor
             if c == '\t'
                 for i in 0..<span
                     if col + i >= self.left && col + i < stop then g.put(int(gutter + col + i - self.left), y, u32(' '), fg, bg)
-            elif span > 0 && col >= self.left && col + span <= stop
+            elif shown > 0 && col >= self.left && col + shown <= stop
                 val ch = if wcwidth(u32(c)) < 0 then 0xFFFD else u32(c)
 
                 last = int(gutter + col - self.left)
-                g.glyph(last, y, ch, int(span), fg, bg)
-            elif span == 0 && last >= 0
+                g.glyph(last, y, ch, int(shown), fg, bg)
+            elif shown == 0 && last >= 0
                 g.extend(last, y, u32(c))
             else
                 last = -1
 
+            // A long line's columns past the glyph: the rest of the character's bytes.
+            for i in shown..<span
+                if col + i >= self.left && col + i < stop then g.put(int(gutter + col + i - self.left), y, u32(' '), fg, bg)
+
             col += span
             off += len
+
+        // On a long line the marks on the last glyph in view have columns past it, and still show.
+        while long && last >= 0 && off < end && is_mark(self.char_at(off).0)
+            g.extend(last, y, u32(self.char_at(off).0))
+            off += self.char_at(off).1
 
         if end >= from && end < to && col >= self.left && col < stop then g.put(int(gutter + col - self.left), y, u32(' '), DEFAULT | REVERSE, DEFAULT)
     end draw_line
 
-    /** Where the query matches in the part of line `n` that can be in view (to screen column
-     * `stop`), when matches are shown.
+    /** Where the query matches between `from` and `upto` on the line whose text is `start..<end`,
+     * counting one that begins before `from` and reaches into it, when matches are shown.
      */
-    hits(*self, n: u64, start: u64, end: u64, stop: u64) -> Buf[(u64, u64)]
+    hits(*self, start: u64, from: u64, end: u64, upto: u64) -> Buf[(u64, u64)]
         var out: Buf[(u64, u64)] = buf()
 
         if !self.lit || self.query.len() == 0 then return out
 
         val len = self.query.len()
-        val hay = self.text.bytes(start, min(end, self.at_column(n, stop) + 4 + u64(len)))
+        val lo = max(start, from - min(from, u64(len)))
+        val hay = self.text.bytes(lo, min(end, upto + 4 + u64(len)))
         val needle = prepared(self.query.view(), self.match_case)
         var i: usize = 0
 
         while i < hay.len() && first_match(hay.view()[i..], needle.view(), self.match_case, hay.len() - i) is Some(k)
-            out.push((start + u64(i + k), start + u64(i + k + len)))
+            out.push((lo + u64(i + k), lo + u64(i + k + len)))
             i += k + len
 
         out
@@ -1216,6 +1433,7 @@ struct Editor
             Replacing -> s"Replace ($case): $entry"
             ReplacingWith -> s"Replace ${from_utf8_lossy(self.query.view())} with: $entry"
             Confirming -> s"Replace this with ${from_utf8_lossy(self.replacement.view())}?"
+            Overwriting -> "The file has changed on disk since it was opened. Save over it?"
             Idle -> if self.message.len > 0 then self.message else self.title()
 
         val end = g.write(1, y, say, DEFAULT | REVERSE | BOLD, DEFAULT)
@@ -1233,11 +1451,17 @@ struct Editor
             g.cursor = Some((end, y))
             return
 
-        val (_, chars) = self.column(self.line, self.at)
+        // A `far` cursor's line is only known to be at least the lines counted so far; on a long line
+        // the column is a byte.
+        val (lo, hi) = self.cursor_line()
+        val (_, chars) = self.column_in(lo, hi, self.at)
         val total = if self.text.lines_known() then s" of ${self.text.line_count()}" else ""
-        val place = s"Ln ${self.line + 1}$total, Col ${chars + 1} "
+        val line = if self.far then s"≥ ${self.text.lines_at_least()}" else s"${self.line + 1}$total"
+        val col = if hi - lo > long_line then "Byte" else "Col"
+        val place = s"Ln $line, $col ${chars + 1} "
+        var room = 0
 
-        val room = int(place.len)
+        for _ in place.chars do room += 1
 
         if noted + 2 + room <= self.w then g.write(self.w - room, y, place, DEFAULT | REVERSE, DEFAULT)
     end status
@@ -1250,7 +1474,7 @@ struct Editor
     /** The keys that work now, the way nano shows them. */
     keys(*self, g: *Grid, y: int)
         val idle: []const (string, string) = [("^S", "Save"), ("^Q", "Quit"), ("^F", "Find"), ("^R", "Replace"),
-            ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^A", "All"), ("^G", "Go to line")]
+            ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^A", "All"), ("^G", "Go to line"), ("^L", "Reload")]
         val shown: []const (string, string) = if self.busy() then [("Esc", "Stop")] else self.prompt match
             Idle -> idle
             Quitting -> [("Y", "Yes"), ("N", "No"), ("Esc", "Cancel")]
@@ -1260,6 +1484,7 @@ struct Editor
             Replacing -> [("Enter", "Next"), ("^T", "Match case"), ("Esc", "Cancel")]
             ReplacingWith -> [("Enter", "Start"), ("Esc", "Cancel")]
             Confirming -> [("Y", "Replace"), ("N", "Skip"), ("A", "All"), ("Esc", "Stop")]
+            Overwriting -> [("Y", "Save over it"), ("N", "Don't save"), ("Esc", "Cancel")]
 
         var x = 0
 
@@ -1279,7 +1504,7 @@ editor(text: Text, w: int = 80, h: int = 24, tab: u64 = tab_width) -> Editor
     before.push((0, 0))
     after.push((0, 0))
     Editor(text, 0, 0, None, 0, 0, w, h, tab, Idle, buf(), false, "", false, before, after, None, None, buf(), 0,
-        Quiet, Quiet, ' ', 0, -double_click - 1, (-1, -1), buf(), buf(), false, false, (0, 0), None, 0)
+        Quiet, Quiet, ' ', 0, -double_click - 1, (-1, -1), buf(), buf(), false, false, (0, 0), None, 0, false, buf())
 
 /** The editor for `te <path>`: the file, a new file of that name where there is none, or an unnamed
  * buffer for an empty path. Any other failure to open it is the error.
@@ -1288,7 +1513,11 @@ load(path: string) -> Result[Editor, string]
     if path.len == 0 then return Ok(editor(empty("")))
 
     open(path) match
-        Ok(t) -> Ok(editor(t))
+        Ok(t) ->
+            var ed = editor(t)
+
+            if ed.text.size() >= big_file then ed.message = s"$path, ${amount(ed.text.size())} (counting lines)"
+            Ok(ed)
         Err(NotFound) ->
             var ed = editor(empty(path))
 
@@ -1321,8 +1550,9 @@ amount(n: u64) -> string
     if n == 1 then return "1 byte"
     if n < 1 << 10 then return s"$n bytes"
     if n < 1 << 20 then return s"${n >> 10} KiB"
+    if n < 1 << 30 then return s"${n >> 20} MiB"
 
-    s"${n >> 20} MiB"
+    s"${n >> 30}.${(n & ((1 << 30) - 1)) * 10 >> 30} GiB"
 
 /** `part` of `whole`, as a percentage. */
 percent(part: u64, whole: u64) -> string = s"${if whole == 0 then 100 else min(part * 100 / whole, 100)}%"
