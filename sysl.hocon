@@ -23,7 +23,9 @@ requires {
   heap  = true
 }
 
-// `termbox2` draws the screen and reads the keys and the mouse.
+// `termbox2` draws the screen and reads the keys and the mouse; `highlighter` tokenizes the lines on
+// screen for their syntax colours, with the grammars it carries.
 dependencies {
-  termbox2 { git = "github.com/sysl-lang/termbox2", version = "0.4.0" }
+  termbox2    { git = "github.com/sysl-lang/termbox2", version = "0.4.0" }
+  highlighter { git = "github.com/sysl-lang/highlighter", version = "0.2.0" }
 }

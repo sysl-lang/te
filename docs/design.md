@@ -91,6 +91,7 @@ the way nano does, but as readable words rather than `^X`:
 | Ctrl+R | replace: Y this one, N skip, A all |
 | Ctrl+G | go to line |
 | Ctrl+L or F5 | reload the file from disk (undo goes back) |
+| Ctrl+E | syntax colours off / on |
 | Ctrl+X / C / V | cut / copy / paste |
 | Ctrl+A | select all |
 | Shift + any move | select |
@@ -109,9 +110,9 @@ ssh**, by OSC 52 (`ESC ] 52 ; c ; <base64> BEL`; the terminal sets the local cli
 256 KiB is not sent — terminals refuse or cut one much longer — and the status bar says it stays in
 te's own clipboard. Paste is meant to arrive as **bracketed paste**, so a pasted block is one insert
 and one undo step and is never auto-indented; te turns it on at start-up and termbox2's `Paste` event
-becomes `Input.Paste`. Line numbers are shown softly (dim, not part of the text);
-colours are true-colour with a fallback to 256. Syntax highlighting comes last, and highlights only
-the visible rows.
+becomes `Input.Paste`. Line numbers are shown softly (dim, not part of the text). Colours are
+true-colour where `COLORTERM` says `truecolor` or `24bit`, the 256 where `TERM` names a `256color`
+terminal, and the eight colours otherwise.
 
 **One undo step is one thing the reader did.** A run of typed characters is one step until the
 cursor is moved or anything else is done, more than a second passes between keys, or a letter or
@@ -165,6 +166,39 @@ disagree. Combining marks take no column and move with the character before them
 base character and the marks, and they are drawn together with `set_cluster`. A sequence joined by
 a zero-width joiner is still laid out character by character, as `wcwidth` counts it.
 
+## Syntax colours
+
+**The grammars are VS Code's TextMate grammars, run by `sysl-lang/highlighter`** on Oniguruma, with
+the grammars it carries (Bash, CSS, Go, HTML, JavaScript, JSON, Python, Rust, TSX, TypeScript, XML,
+YAML, sysl). A file's grammar is its extension's, in any case, else that of the program its `#!`
+line runs — through `env` or not, without its version (`python3` is Python, `node` JavaScript). A
+file with neither is plain, and Ctrl+E says so. A save under a new name reads the file with the new
+name's grammar. The theme is One Dark: its own colours in true-colour, the nearest of the 256 (a grey
+from the ramp where the channels are nearly equal, otherwise from the cube) in 256, and in the eight
+colours a fixed choice by meaning — keywords magenta, strings green, comments cyan, numbers red,
+types yellow, functions blue. A search match is black on yellow in every mode, the selection reversed.
+
+**Only the visible rows are tokenized**, a line at a time (`tokenize_line`), each from the state the
+line above left. The lines tokenized are kept (`colour.sysl`), each by the offset it starts at —
+never by line number, which a huge file does not know — with the state it started in and the one it
+left, so a screen further down goes on from the last line kept, and scrolling back within them
+tokenizes nothing. **A screen with no kept line within 64 KiB above it starts at the first line that
+begins in the 64 KiB above its first row, as if nothing were open there**: a block comment opened
+further up than that is not seen. That is the bound on what one frame reads and tokenizes, whatever
+the file's size, and why a huge file's first screen still reads one piece and Ctrl+End before the
+count stays bounded.
+
+**An edit lets go of the lines it touched and holds the ones below it**, moved by what it added or
+removed. The lines from the edit down are tokenized again; at the first whose new starting state
+equals the one it had, the held lines come back as they were, since nothing below can have changed.
+So typing in a line that opens nothing tokenizes that line once, and closing a block comment early
+re-colours every line below it on screen. An undo, a redo or a reload, which can change the text
+anywhere, lets go of every line.
+
+A line over 32 KiB is not tokenized, and the line after it starts as if nothing were open; nor is a
+line that is not UTF-8, which passes its state on. Only the first 20000 bytes of a line are matched
+(the highlighter's limit, as VS Code's); the rest of such a line is uncoloured.
+
 ## Milestones
 
 1. **Core** — the piece tree over the mapped file and the add buffer, undo/redo, byte and line
@@ -174,4 +208,5 @@ a zero-width joiner is still laid out character by character, as `wcwidth` count
    grouping, goto line, mouse. Bracketed paste and combining marks are done.
 4. **Huge files** — line totals counted in the background, Ctrl+End before the count, byte columns
    on long lines, external-change detection and reload.
-5. **Highlighting** — per-language, visible rows only.
+5. **Highlighting** — per-language through `sysl-lang/highlighter`, visible rows only, kept by
+   offset and re-tokenized from an edit down to the first line whose state is unchanged.

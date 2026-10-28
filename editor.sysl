@@ -35,7 +35,7 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, NotFound}
 import sysl.math.{min, max}
 import sysl.text.{chars_of, from_utf8_lossy, parse_ulong, split}
-import sh.sysl.termbox2.{Key, wcwidth, DEFAULT, REVERSE, DIM, BOLD, BLACK, YELLOW}
+import sh.sysl.termbox2.{Key, wcwidth, DEFAULT, REVERSE, DIM, BOLD}
 
 /** How many columns a tab reaches to a multiple of. */
 const tab_width: u64 = 4
@@ -216,6 +216,9 @@ struct Editor
      */
     far: bool
     far_rows: Buf[u64]
+
+    /** The syntax colours, and the lines on screen already tokenized. Ctrl+E turns them off and on. */
+    colours: Colours
 
     // ---- layout ------------------------------------------------------------------------------
 
@@ -580,6 +583,7 @@ struct Editor
 
         val before = (self.at, self.line)
 
+        self.colours.edit(self.at, 0, bytes.len)
         self.text.insert(self.at, bytes)
         self.at += bytes.len
         for b in bytes do if b == u8('\n') then self.line += 1
@@ -589,6 +593,7 @@ struct Editor
     remove(*self, from: u64, to: u64, line: u64)
         val before = (self.at, self.line)
 
+        self.colours.edit(from, to - from, 0)
         self.text.delete(from, to - from)
         self.at = from
         self.line = line
@@ -624,6 +629,7 @@ struct Editor
 
     undo(*self)
         self.anchor = None
+        self.colours.forget()
         if self.text.undo() then
             val (at, line) = self.before[self.text.now + 1]
 
@@ -631,6 +637,7 @@ struct Editor
 
     redo(*self)
         self.anchor = None
+        self.colours.forget()
         if self.text.redo() then
             val (at, line) = self.after[self.text.now]
 
@@ -742,6 +749,7 @@ struct Editor
 
         val before = (self.at, self.line)
 
+        self.colours.edit(self.at, 0, slice_size(piece))
         self.text.insert_slice(self.at, piece)
         self.at += slice_size(piece)
         self.line += self.text.slice_lines(piece)
@@ -907,6 +915,7 @@ struct Editor
 
             val at = starts[k]
 
+            self.colours.edit(at, n, r)
             self.text.delete(at, n)
             self.text.insert(at, self.replacement.view())
             if h.keep >= at + n then
@@ -998,19 +1007,37 @@ struct Editor
             self.message = s"Could not reload ${self.text.path}: $e"
             return
 
+        self.colours.forget()
+
         val line = if self.has_line(self.line) then self.line else self.last_line()
 
         self.place(self.at_column(line, col), line)
         self.edited(before)
         self.message = s"Reloaded ${self.text.path}"
 
-    save_as(*self, path: string) -> bool = self.text.save_as(path) match
-        Ok(_) ->
-            self.message = s"Saved $path"
-            true
-        Err(e) ->
-            self.message = s"Could not save $path: $e"
-            false
+    /** Saves to `path`; a new name is read with the grammar its extension names. */
+    save_as(*self, path: string) -> bool
+        val renamed = path != self.text.path
+
+        self.text.save_as(path) match
+            Ok(_) ->
+                if renamed then self.colours.redetect(path, head(self.text).view())
+                self.message = s"Saved $path"
+                true
+            Err(e) ->
+                self.message = s"Could not save $path: $e"
+                false
+    end save_as
+
+    /** Ctrl+E: the syntax colours off, or on again. */
+    toggle_colours(*self)
+        if self.colours.hl is None
+            self.message = "No colours: the file's language is not known"
+            return
+
+        self.colours.on = !self.colours.on
+        self.message = if self.colours.on then "Colours on" else "Colours off"
+    end toggle_colours
 
     quit(*self)
         if self.text.modified() then self.prompt = Quitting else self.done = true
@@ -1098,6 +1125,7 @@ struct Editor
             CtrlS -> self.save()
             CtrlQ -> self.quit()
             CtrlL | F5 -> self.reload()
+            CtrlE -> self.toggle_colours()
             CtrlG ->
                 self.prompt = GoingTo
                 self.entry.clear()
@@ -1339,8 +1367,8 @@ struct Editor
         self.prompt == GoingTo || self.prompt == Naming || self.prompt == Finding || self.prompt == Replacing || self.prompt == ReplacingWith
 
     /** The line whose text is `start..<end`, the part of it in view. The selection is drawn reversed,
-     * a selected line break as one reversed cell after the text, and the query's matches black on
-     * yellow.
+     * a selected line break as one reversed cell after the text, the query's matches black on
+     * yellow, and the rest in its syntax colours.
      *
      * **A long line is drawn a byte to a column** (`long_line`), so drawing starts at the first byte in
      * view rather than at the line's start: a character takes as many columns as it has bytes, its
@@ -1352,7 +1380,10 @@ struct Editor
         val (from, to) = self.selection().unwrap_or((0, 0))
         var off = if long then self.text.char_start(min(start + self.left, end)) else start
         val hits = self.hits(start, off, end, if long then min(end, start + stop) else self.at_column_in(start, end, stop))
+        val shade = self.colours.shade(&self.text, start, end)
+        val hit = (self.colours.scheme.hit_fg, self.colours.scheme.hit_bg)
         var h: usize = 0
+        var s: usize = 0
         var col = off - start
         var last = -1
 
@@ -1362,11 +1393,14 @@ struct Editor
             val shown = if long && c != '\t' then cells(c, 0, self.tab) else span
 
             while h < hits.len() && hits[h].1 <= off do h += 1
+            while s < shade.len() && start + shade[s].0 <= off do s += 1
 
             val (fg, bg) = if off >= from && off < to then
                 (DEFAULT | REVERSE, DEFAULT)
             elif h < hits.len() && hits[h].0 <= off then
-                (BLACK, YELLOW)
+                hit
+            elif s < shade.len() then
+                (shade[s].1, DEFAULT)
             else
                 (DEFAULT, DEFAULT)
 
@@ -1474,7 +1508,7 @@ struct Editor
     /** The keys that work now, the way nano shows them. */
     keys(*self, g: *Grid, y: int)
         val idle: []const (string, string) = [("^S", "Save"), ("^Q", "Quit"), ("^F", "Find"), ("^R", "Replace"),
-            ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^A", "All"), ("^G", "Go to line"), ("^L", "Reload")]
+            ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^A", "All"), ("^G", "Go to line"), ("^L", "Reload"), ("^E", "Colours")]
         val shown: []const (string, string) = if self.busy() then [("Esc", "Stop")] else self.prompt match
             Idle -> idle
             Quitting -> [("Y", "Yes"), ("N", "No"), ("Esc", "Cancel")]
@@ -1501,10 +1535,12 @@ editor(text: Text, w: int = 80, h: int = 24, tab: u64 = tab_width) -> Editor
     var before: Buf[Spot] = buf()
     var after: Buf[Spot] = buf()
 
+    val colours = colours_for(text.path, head(text).view())
+
     before.push((0, 0))
     after.push((0, 0))
     Editor(text, 0, 0, None, 0, 0, w, h, tab, Idle, buf(), false, "", false, before, after, None, None, buf(), 0,
-        Quiet, Quiet, ' ', 0, -double_click - 1, (-1, -1), buf(), buf(), false, false, (0, 0), None, 0, false, buf())
+        Quiet, Quiet, ' ', 0, -double_click - 1, (-1, -1), buf(), buf(), false, false, (0, 0), None, 0, false, buf(), colours)
 
 /** The editor for `te <path>`: the file, a new file of that name where there is none, or an unnamed
  * buffer for an empty path. Any other failure to open it is the error.

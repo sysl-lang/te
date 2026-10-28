@@ -1,0 +1,391 @@
+// Syntax colours: which grammar a file is read with, what colour each token is drawn in, and the lines
+// already tokenized.
+//
+// **Only the lines on screen are tokenized**, a line at a time by `sh.sysl.highlighter`'s
+// `tokenize_line`, each from the state the line above it left. What a line starts in depends on every
+// line above it, so the lines tokenized are kept (`Shade`), by the offset each one starts at -- never
+// by line number, which a huge file does not know yet -- and a screen further down goes on from the
+// last one kept. A screen with no kept line above it within `scan_back` bytes starts tokenizing at
+// the first line that begins in the `scan_back` bytes above its first row, as if nothing were open
+// there: a block comment opened further up than that is not seen. That bounds what one frame reads
+// and tokenizes, whatever the size of the file.
+//
+// **An edit lets go of the lines it touches and holds on to the ones below it** (`edit`), moved by
+// what it added or removed, with the state each one started in. The lines from the edit down are
+// tokenized again, and at the first whose new starting state is the one it had before, the held lines
+// come back as they were, since nothing below it can have changed. An edit that closes a block comment
+// re-colours every line below it on screen; one inside a line that opens nothing re-tokenizes that
+// line alone.
+//
+// A line longer than `long_line` is not tokenized -- the screen draws it a byte to a column -- and the
+// line after it starts as if nothing were open. A line that is not UTF-8 is not tokenized either, and
+// passes on the state it was given.
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{min, max}
+import sysl.text.{from_utf8, from_utf8_lossy}
+import sh.sysl.highlighter.{Highlighter, LineState, Theme, from_json, grammar_for_extension, grammar_for_language, one_dark}
+import sh.sysl.termbox2.{OutputMode, Normal, Color256, Truecolor, rgb, DEFAULT, BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, HI_BLACK}
+
+/** How far above the first row on screen tokenizing may start, in bytes, when no line kept reaches it. */
+const scan_back: u64 = 64 << 10
+
+/** The most lines kept; past it the earlier half is let go. */
+const kept_lines: usize = 1 << 14
+
+/** The terminal colour of each token category, and of a search match, in one output mode. */
+struct Scheme
+    keyword: u64
+    string: u64
+    comment: u64
+    number: u64
+    `type`: u64
+    function: u64
+    variable: u64
+    punctuation: u64
+    hit_fg: u64
+    hit_bg: u64
+
+    /** The colour a token of category `cat` is drawn in: `DEFAULT` for a token with none. */
+    of(self, cat: string) -> u64
+        if cat == "keyword" then return self.keyword
+        if cat == "string" then return self.string
+        if cat == "comment" then return self.comment
+        if cat == "number" then return self.number
+        if cat == "type" then return self.`type`
+        if cat == "function" then return self.function
+        if cat == "variable" then return self.variable
+        if cat == "punctuation" then return self.punctuation
+
+        DEFAULT
+    end of
+end Scheme
+
+/** `theme` in output mode `mode`. **The eight colours of `Normal` are the same whatever the theme**: a
+ * terminal with only those has its own idea of each, so they are chosen by meaning. A search match is
+ * black on yellow in every mode, spelled as each mode spells it.
+ */
+scheme(theme: Theme, mode: OutputMode) -> Scheme = mode match
+    Truecolor -> Scheme(true_colour(theme.keyword), true_colour(theme.string), true_colour(theme.comment),
+        true_colour(theme.number), true_colour(theme.`type`), true_colour(theme.function), true_colour(theme.variable),
+        true_colour(theme.punctuation), HI_BLACK, rgb(255, 215, 0))
+    Color256 -> Scheme(index_256(theme.keyword), index_256(theme.string), index_256(theme.comment),
+        index_256(theme.number), index_256(theme.`type`), index_256(theme.function), index_256(theme.variable),
+        index_256(theme.punctuation), HI_BLACK, 220)
+    _ -> Scheme(MAGENTA, GREEN, CYAN, RED, YELLOW, BLUE, DEFAULT, DEFAULT, BLACK, YELLOW)
+end scheme
+
+/** The output mode for a terminal: `Truecolor` where `COLORTERM` says it has it, `Color256` where `TERM`
+ * names a 256-colour terminal, and the eight colours otherwise.
+ */
+mode_for(colorterm: string, term: string) -> OutputMode =
+    if colorterm == "truecolor" || colorterm == "24bit" then Truecolor elif term.contains("256color") then Color256 else Normal
+
+/** `#rrggbb` as one number, `0xrrggbb`; `None` for anything else. */
+hex_colour(hex: string) -> Option[u64]
+    val b = hex.bytes
+
+    if b.len != 7 || b[0] != u8('#') then return None
+
+    var v: u64 = 0
+
+    for i in 1..<7
+        val c = b[i]
+        val d = if c >= u8('0') && c <= u8('9') then
+            c - u8('0')
+        elif c >= u8('a') && c <= u8('f') then
+            c - u8('a') + 10
+        elif c >= u8('A') && c <= u8('F') then
+            c - u8('A') + 10
+        else
+            return None
+
+        v = v * 16 + d
+
+    Some(v)
+end hex_colour
+
+/** A theme colour in `Truecolor`, where 0 is the default colour and black is `HI_BLACK`. */
+true_colour(hex: string) -> u64 = hex_colour(hex) match
+    Some(0) -> HI_BLACK
+    Some(v) -> v
+    None -> DEFAULT
+
+/** The nearest of the 256 colours to a theme colour: a grey from the ramp, 232 to 255, where the
+ * channels are nearly equal, otherwise a colour from the six-by-six-by-six cube, 16 to 231.
+ */
+index_256(hex: string) -> u64
+    val v = hex_colour(hex).unwrap_or(0)
+    val (r, g, b) = (v >> 16, (v >> 8) & 255, v & 255)
+
+    if max(r, max(g, b)) - min(r, min(g, b)) < 16
+        val grey = (r + g + b) / 3
+
+        if grey < 4 then return 16
+        if grey > 246 then return 231
+        return 232 + min((max(grey, 8) - 3) / 10, 23)
+
+    16 + 36 * cube_level(r) + 6 * cube_level(g) + cube_level(b)
+end index_256
+
+// The cube's levels are 0, 95, 135, 175, 215 and 255; a channel takes the nearest.
+private cube_level(c: u64) -> u64 = if c < 48 then 0 elif c < 115 then 1 else (c - 35) / 40
+
+/** The grammar a file is read with: the one for its name's extension, else the one for the program
+ * its `#!` first line runs. `head` is the file's first bytes.
+ */
+grammar_of(path: string, head: []const u8) -> Option[string]
+    val base = after_last(path, u8('/'))
+
+    if base.last_index_of_byte(u8('.')) is Some(i) && i > 0
+        if grammar_for_extension(base[i + 1..<base.len]) is Some(g) then return Some(g)
+
+    interpreter(head) match
+        Some(name) -> grammar_for_language(name)
+        None -> None
+end grammar_of
+
+/** The program a `#!` line runs, without its directory or version (`python3` is `python`, `node` is
+ * `js`); `env`, its options and its variable settings are passed over.
+ */
+interpreter(head: []const u8) -> Option[string]
+    if head.len < 2 || head[0] != u8('#') || head[1] != u8('!') then return None
+
+    var i: usize = 2
+
+    while i < head.len && head[i] != u8('\n')
+        if is_space(head[i])
+            i += 1
+            continue
+
+        val from = i
+
+        while i < head.len && head[i] != u8('\n') && !is_space(head[i]) do i += 1
+
+        val name = after_last(from_utf8_lossy(head[from..<i]), u8('/'))
+
+        if name != "env" && !name.starts_with("-") && !name.contains("=")
+            val bare = without_version(name)
+
+            return Some(if bare == "node" then "js" else bare)
+
+    None
+end interpreter
+
+private is_space(b: u8) -> bool = b == u8(' ') || b == u8('\t') || b == u8('\r')
+
+private after_last(s: string, b: u8) -> string = s.last_index_of_byte(b) match
+    Some(i) -> s[i + 1..<s.len]
+    None -> s
+
+private without_version(name: string) -> string
+    var end = name.len
+
+    while end > 0 && (name.bytes[end - 1] == u8('.') || (name.bytes[end - 1] >= u8('0') && name.bytes[end - 1] <= u8('9'))) do end -= 1
+    name[0..<end]
+
+/** One line tokenized: where it is, the state it started in and the one it left, and its colours --
+ * each run's end, as an offset from the line's start, and its colour. `next` is where the line after
+ * it starts, and is `end` for a last line with no line break.
+ */
+struct Shade
+    start: u64
+    end: u64
+    next: u64
+    entry: LineState
+    exit: LineState
+    runs: Buf[(u64, u64)]
+
+    /** Whether an edit at `at` leaves this line as it was: the line and its line break are before it. */
+    before(self, at: u64) -> bool = self.next <= at && self.next > self.end
+
+    moved(self, by_added: u64, by_removed: u64) -> Shade =
+        Shade(self.start + by_added - by_removed, self.end + by_added - by_removed, self.next + by_added - by_removed, self.entry, self.exit, self.runs)
+end Shade
+
+/** A text's colours: its grammar if it has one, whether they are shown, the lines kept in order down
+ * the text, and the lines held from below an edit until a line's state rejoins them.
+ */
+struct Colours
+    hl: Option[Highlighter]
+    on: bool
+    scheme: Scheme
+    lines: Buf[Shade]
+    held: Buf[Shade]
+
+    /** How many lines have been tokenized. */
+    tokenized: u64
+
+    /** Whether lines are coloured: there is a grammar, and the colours are on. */
+    shown(self) -> bool = self.on && self.hl.is_some()
+
+    /** Every line let go: what an undo, a redo or a reload needs, as they change the text anywhere. */
+    forget(*self)
+        self.lines.clear()
+        self.held.clear()
+
+    /** The colours in `mode`; the lines kept are let go, since their colours are spelled for another. */
+    set_mode(*self, mode: OutputMode)
+        self.scheme = scheme(one_dark(), mode)
+        self.forget()
+
+    /** The grammar for a file named `path` whose first bytes are `head`, after a save under a new name. */
+    redetect(*self, path: string, head: []const u8)
+        self.hl = highlighter_for(path, head)
+        self.forget()
+
+    /** `removed` bytes at `at` were replaced by `added`: the lines it touched are let go, and those
+     * below it held, moved to where they are now, for `add` to take back.
+     */
+    edit(*self, at: u64, removed: u64, added: u64)
+        var held: Buf[Shade] = buf()
+        var keep: usize = 0
+
+        for l in self.held.view() do if l.before(at) then held.push(l)
+        while keep < self.lines.len() && self.lines[keep].before(at) do keep += 1
+        for l in self.lines.view()[keep..] do if l.start > at + removed then held.push(l.moved(added, removed))
+        for l in self.held.view() do if l.start > at + removed then held.push(l.moved(added, removed))
+
+        self.lines.truncate(keep)
+        self.held = held
+    end edit
+
+    /** The colour runs of the line `start..<end` of `text`, tokenizing what it has to: nothing for
+     * a line not coloured.
+     */
+    shade(*self, text: *Text, start: u64, end: u64) -> Buf[(u64, u64)]
+        if !self.shown() || end - start > long_line then return buf()
+
+        loop
+            if self.find(start) is Some(i) then return self.lines[i].runs
+
+            val (at, state) = self.resume(text, start)
+
+            if at == start
+                val next = if end == text.size() then end elif text.byte_at(end) == u8('\r') then end + 2 else end + 1
+
+                self.add(text, start, end, next, state)
+            else
+                val nl = newline_from(text, at)
+                val stop = if nl > at && text.byte_at(nl - 1) == u8('\r') then nl - 1 else nl
+
+                self.add(text, at, stop, nl + 1, state)
+    end shade
+
+    // The kept line starting at `start`.
+    private find(self, start: u64) -> Option[usize]
+        var lo: usize = 0
+        var hi = self.lines.len()
+
+        while lo < hi
+            val mid = (lo + hi) / 2
+
+            if self.lines[mid].start < start then lo = mid + 1 else hi = mid
+
+        if lo < self.lines.len() && self.lines[lo].start == start then Some(lo) else None
+    end find
+
+    // Where to go on tokenizing from to reach the line at `start`, and the state there: the line after
+    // the last one kept where that is above `start` and near enough, or else a fresh start found by
+    // reading back from `start`, with the kept lines let go.
+    private resume(*self, text: *Text, start: u64) -> (u64, LineState)
+        val n = self.lines.len()
+
+        if n > 0
+            val last = self.lines[n - 1]
+
+            if last.next > last.end && last.next <= start && start - last.next <= scan_back then return (last.next, last.exit)
+
+        // The held lines stay: a line below the edit an earlier frame had above it can still rejoin them.
+        self.lines.clear()
+        (start_above(text, start), self.hl.unwrap().initial_state())
+    end resume
+
+    // Keeps the line `start..<end`, whose state at its start is `state` -- or, where it is the first of
+    // the held lines and its state is the one it had, takes the held lines back instead.
+    private add(*self, text: *Text, start: u64, end: u64, next: u64, state: LineState)
+        while self.held.len() > 0 && self.held[0].start < start do self.held.remove(0)
+
+        if self.held.len() > 0 && self.held[0].start == start
+            if self.held[0].entry == state
+                self.rejoin()
+                return
+            self.held.remove(0)
+
+        if self.lines.len() >= kept_lines
+            var later: Buf[Shade] = buf()
+
+            later.extend(self.lines.view()[kept_lines / 2..])
+            self.lines = later
+
+        val h = self.hl.unwrap()
+        var runs: Buf[(u64, u64)] = buf()
+        var exit = state
+
+        if end - start > long_line
+            exit = h.initial_state()
+        elif from_utf8(text.bytes(start, end).view()) is Ok(line) && h.tokenize_line(line, state) is Ok(r)
+            var off: u64 = 0
+
+            self.tokenized += 1
+            for t in r.tokens.view()
+                off += t.text.len
+                runs.push((off, self.scheme.of(h.category_of(t))))
+            exit = r.state
+
+        self.lines.push(Shade(start, end, next, state, exit, runs))
+    end add
+
+    // Takes back the held lines that follow on one from another, from the first; the rest stay held.
+    private rejoin(*self)
+        var i: usize = 0
+
+        loop
+            self.lines.push(self.held[i])
+            i += 1
+
+            if i == self.held.len() then break
+
+            val prev = self.held[i - 1]
+
+            if prev.next != self.held[i].start || prev.exit != self.held[i].entry then break
+
+        var rest: Buf[Shade] = buf()
+
+        rest.extend(self.held.view()[i..])
+        self.held = rest
+    end rejoin
+end Colours
+
+/** Colours for a file named `path` whose first bytes are `head`, shown, in the eight colours. */
+colours_for(path: string, head: []const u8) -> Colours = Colours(highlighter_for(path, head), true, scheme(one_dark(), Normal), buf(), buf(), 0)
+
+/** The bytes a `#!` line is looked for in: the first 256 of the text. */
+head(text: Text) -> Buf[u8] = text.bytes(0, min(text.size(), 256))
+
+private highlighter_for(path: string, head: []const u8) -> Option[Highlighter] = grammar_of(path, head) match
+    Some(g) -> from_json(g).ok()
+    None -> None
+
+// Where the first line starting in the `scan_back` bytes above `start` begins, or `start` where none
+// does: the earliest line a screen whose first row starts at `start` tokenizes from.
+private start_above(text: *Text, start: u64) -> u64
+    if start <= scan_back then return 0
+
+    val above = text.bytes(start - scan_back, start)
+    var i: usize = 0
+
+    while i < above.len() && above[i] != u8('\n') do i += 1
+    if i == above.len() then start else start - scan_back + u64(i) + 1
+end start_above
+
+// The offset of the first line break at or after `at`, which there is.
+private newline_from(text: *Text, at: u64) -> u64
+    var off = at
+
+    loop
+        val c = text.chunk_at(off)
+
+        for i in 0..<c.len do if c[i] == u8('\n') then return off + u64(i)
+        off += u64(c.len)
+end newline_from

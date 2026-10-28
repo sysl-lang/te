@@ -16,7 +16,7 @@ sysl test .
 `te` with no file is an unnamed buffer that asks for a name on Ctrl+S; a file that does not exist yet
 is created on the first save.
 
-**Status:** milestones 1 to 4 are done. The view shows line numbers, scrolls sideways for long
+**Status:** milestones 1 to 5 are done. The view shows line numbers, scrolls sideways for long
 lines, draws tabs to a width of 4 and East Asian wide characters in two cells. Typing, Enter (keeping
 the line's indentation, and a CRLF file's line breaks), Backspace and Delete, the arrows, Home/End
 (Home goes to the indentation first), PgUp/PgDn, Ctrl+Home/End and Ctrl+arrows by word all work, as
@@ -40,3 +40,11 @@ the count is done goes to the end at once, showing `Ln ≥ N` until the count ca
 drawing on it cost the same anywhere along it; the status bar says `Byte` in place of `Col` there. A
 save over a file that changed on disk since it was opened asks first, and Ctrl+L (or F5) reloads the
 file, keeping the cursor's line; an undo goes back to the text before the reload.
+
+Syntax colours: the file's language is found by its extension or its `#!` line, and the rows on
+screen are coloured with VS Code's grammars through
+[`sysl-lang/highlighter`](https://github.com/sysl-lang/highlighter) (which needs Oniguruma: `brew
+install oniguruma`, Debian's `libonig-dev`) — Bash, CSS, Go, HTML, JavaScript, JSON, Python, Rust,
+TypeScript, XML, YAML and sysl — in true-colour, 256 or 8 colours as the terminal has them. Only the
+visible rows are tokenized, from at most 64 KiB above them, so a huge file opens as fast as before.
+Ctrl+E turns the colours off and on.

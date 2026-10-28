@@ -1,0 +1,479 @@
+@tests
+
+// Syntax colours: the grammar a file is read with, the colours drawn on the grid in each output mode,
+// what an edit re-tokenizes, and the bounds on what a frame reads.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, create}
+import sysl.text.from_utf8
+import sh.sysl.highlighter.one_dark
+import sh.sysl.termbox2.{Key, Normal, Color256, Truecolor, DEFAULT, REVERSE, BLACK, YELLOW, MAGENTA, GREEN, CYAN, RED, BLUE, HI_BLACK, rgb}
+
+/** An editor over `text` in a file called `name` of its own, on a screen `w` by `h`. */
+private fixture(name: string, text: string, w: int = 60, h: int = 12) -> (string, Editor)
+    val dir = make_temp_dir("te-colour").unwrap()
+    val file = s"$dir/$name"
+
+    write_text(file, text).unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(w, h))
+    (dir, ed)
+
+private drawn(ed: *Editor) -> Grid
+    var g = grid()
+
+    ed.render(&g)
+    g
+
+private typed(ed: *Editor, s: string)
+    for c in s.chars do ed.handle(Type(c))
+
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false, false))
+
+private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true, false))
+
+/** The foreground of the first cell of `word` on row `y`, which holds it. */
+private fg_of(g: Grid, y: int, word: string) -> u64
+    val at = g.row(y).index_of(word)
+
+    assert(at.is_some(), s"'$word' is not on row $y: '${g.row(y)}'")
+    g.at(int(at.unwrap()), y).fg
+
+private const python = "def f(x):\n    # note\n    return \"s\" + 1\n"
+
+// ---- the colours on the grid -------------------------------------------------------------------
+
+@test("a Python file is drawn in the eight colours by meaning: keyword, function, comment, string, number")
+colour_normal()
+    val (dir, ed0) = fixture("a.py", python)
+    var ed = ed0
+    val g = drawn(&ed)
+
+    assert_eq(fg_of(g, 0, "def"), MAGENTA)
+    assert_eq(fg_of(g, 0, "f("), BLUE)
+    assert_eq(fg_of(g, 1, "# note"), CYAN)
+    assert_eq(fg_of(g, 1, "note"), CYAN, "the comment's text, not only its marker")
+    assert_eq(fg_of(g, 2, "return"), MAGENTA)
+    assert_eq(fg_of(g, 2, "\"s\""), GREEN, "a string's quotes take the string's colour")
+    assert_eq(fg_of(g, 2, "1"), RED)
+    assert_eq(g.at(0, 0).fg, DEFAULT, "the gutter is not coloured")
+    remove_dir_all(dir).unwrap()
+
+@test("in Truecolor a token is the theme's own colour, and in Color256 the nearest of the 256")
+colour_modes()
+    val (dir, ed0) = fixture("a.py", python)
+    var ed = ed0
+
+    ed.colours.set_mode(Truecolor)
+    var g = drawn(&ed)
+    assert_eq(fg_of(g, 0, "def"), 0xc678dd)
+    assert_eq(fg_of(g, 1, "note"), 0x5c6370)
+    assert_eq(fg_of(g, 2, "\"s\""), 0x98c379)
+
+    ed.colours.set_mode(Color256)
+    g = drawn(&ed)
+    assert_eq(fg_of(g, 0, "def"), index_256(one_dark().keyword))
+    assert_eq(fg_of(g, 1, "note"), index_256(one_dark().comment))
+
+    ed.colours.set_mode(Normal)
+    assert_eq(fg_of(drawn(&ed), 0, "def"), MAGENTA, "back in Normal, nothing kept from another mode")
+    remove_dir_all(dir).unwrap()
+
+@test("a search match is black on yellow in each mode, spelled as that mode spells it, over the syntax colour")
+colour_hits()
+    val (dir, ed0) = fixture("a.py", python)
+    var ed = ed0
+
+    ctrl(&ed, CtrlF)
+    typed(&ed, "return")
+    key(&ed, Enter)
+
+    for (mode, fg, bg) in [(Normal, BLACK, YELLOW), (Color256, HI_BLACK, 220), (Truecolor, HI_BLACK, rgb(255, 215, 0))]
+        ed.colours.set_mode(mode)
+        val g = drawn(&ed)
+        val x = int(g.row(2).index_of("return").unwrap())
+
+        assert_eq((g.at(x, 2).fg, g.at(x, 2).bg), (fg, bg), s"mode $mode")
+        assert_eq(g.at(x + 6, 2).bg, DEFAULT, "the match ends where the word does")
+
+    remove_dir_all(dir).unwrap()
+
+@test("the selection is drawn reversed over the syntax colours")
+colour_selection()
+    val (dir, ed0) = fixture("a.py", python)
+    var ed = ed0
+
+    ctrl(&ed, CtrlA)
+    assert_eq(fg_of(drawn(&ed), 0, "def") & REVERSE, REVERSE)
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+E turns the colours off and on; a file with no known language is plain and says why")
+colour_toggle()
+    val (dir, ed0) = fixture("a.py", python)
+    var ed = ed0
+
+    ctrl(&ed, CtrlE)
+    assert_eq(ed.message, "Colours off")
+    assert_eq(fg_of(drawn(&ed), 0, "def"), DEFAULT)
+    ctrl(&ed, CtrlE)
+    assert_eq(ed.message, "Colours on")
+    assert_eq(fg_of(drawn(&ed), 0, "def"), MAGENTA)
+
+    val (d2, ed1) = fixture("a.txt", python)
+    var plain = ed1
+    val g = drawn(&plain)
+
+    for y in 0..<3
+        for x in 2..<60 do assert_eq(g.at(x, y).fg, DEFAULT, s"($x, $y) is coloured")
+    ctrl(&plain, CtrlE)
+    assert_eq(plain.message, "No colours: the file's language is not known")
+    remove_dir_all(dir).unwrap()
+    remove_dir_all(d2).unwrap()
+
+// ---- which grammar -----------------------------------------------------------------------------
+
+@test("the grammar is the extension's, in any case, else the #! line's program; neither is plain")
+colour_detect()
+    assert(grammar_of("x/a.rs", []).is_some())
+    assert(grammar_of("A.PY", []).is_some())
+    assert(grammar_of("a.sysl", []).is_some())
+    assert(grammar_of("notes.txt", []).is_none())
+    assert(grammar_of("Makefile", []).is_none())
+    assert(grammar_of(".bashrc", []).is_none(), "a leading dot is a hidden file, not an extension")
+    assert(grammar_of("dir.py/script", "#!/bin/sh\n".bytes).is_some(), "a dot in a directory is not the file's")
+    assert(grammar_of("script", "echo hi\n".bytes).is_none())
+
+    assert_eq(interpreter("#!/bin/sh\n".bytes), Some("sh"))
+    assert_eq(interpreter("#!/usr/bin/env python3\nprint()".bytes), Some("python"))
+    assert_eq(interpreter("#!/usr/bin/python3.11 -u\n".bytes), Some("python"))
+    assert_eq(interpreter("#! /usr/bin/env -S LANG=C node --x\n".bytes), Some("js"))
+    assert_eq(interpreter("#!/usr/bin/env bash\r\n".bytes), Some("bash"))
+    assert_eq(interpreter("#!\n/bin/sh".bytes), None, "the program is on the #! line or nowhere")
+    assert_eq(interpreter("# /bin/sh\n".bytes), None)
+    assert_eq(interpreter("#".bytes), None)
+    assert_eq(interpreter([]), None)
+
+@test("a file with no extension is read by its #! line's program")
+colour_shebang()
+    val (dir, ed0) = fixture("tool", "#!/usr/bin/env python3\ndef f(): pass\n")
+    var ed = ed0
+
+    assert_eq(fg_of(drawn(&ed), 1, "def"), MAGENTA)
+    remove_dir_all(dir).unwrap()
+
+@test("a buffer saved under a name with an extension is coloured by it from then on")
+colour_save_as()
+    val dir = make_temp_dir("te-colour").unwrap()
+    var ed = load(s"$dir/notes").unwrap()
+
+    ed.handle(Resized(60, 12))
+    typed(&ed, "def f(): pass")
+    assert_eq(fg_of(drawn(&ed), 0, "def"), DEFAULT)
+    assert(ed.save_as(s"$dir/f.py"))
+    assert_eq(fg_of(drawn(&ed), 0, "def"), MAGENTA)
+    assert(ed.save_as(s"$dir/f.txt"))
+    assert_eq(fg_of(drawn(&ed), 0, "def"), DEFAULT)
+    remove_dir_all(dir).unwrap()
+
+@test("the terminal's mode comes from COLORTERM, then TERM")
+colour_mode_for()
+    assert_eq(mode_for("truecolor", "xterm"), Truecolor)
+    assert_eq(mode_for("24bit", ""), Truecolor)
+    assert_eq(mode_for("", "xterm-256color"), Color256)
+    assert_eq(mode_for("yes", "screen-256color"), Color256)
+    assert_eq(mode_for("", "xterm"), Normal)
+    assert_eq(mode_for("", ""), Normal)
+
+@test("a theme colour is parsed from #rrggbb and mapped to the 256 by the cube or the grey ramp")
+colour_mapping()
+    assert_eq(hex_colour("#c678dd"), Some(0xc678dd))
+    assert_eq(hex_colour("#ABCDEF"), Some(0xabcdef))
+    assert_eq(hex_colour("c678dd"), None)
+    assert_eq(hex_colour("#c678d"), None)
+    assert_eq(hex_colour("#c678dg"), None)
+    assert_eq(true_colour("#000000"), HI_BLACK, "0 is the default colour, so black is HI_BLACK")
+    assert_eq(true_colour("#e06c75"), 0xe06c75)
+    assert_eq(true_colour("red"), DEFAULT)
+    assert_eq(index_256("#ff0000"), 196)
+    assert_eq(index_256("#00ff00"), 46)
+    assert_eq(index_256("#5f87af"), 16 + 36 * 1 + 6 * 2 + 3)
+    assert_eq(index_256("#000000"), 16)
+    assert_eq(index_256("#ffffff"), 231)
+    assert_eq(index_256("#808080"), 232 + 12)
+    assert_eq(index_256("#7f8085"), 232 + 12, "channels within 16 of each other are a grey")
+    assert_eq(index_256("#abb2bf"), 16 + 36 * 3 + 6 * 3 + 3, "channels further apart are from the cube")
+
+// ---- what an edit re-tokenizes -----------------------------------------------------------------
+
+private const rust = "let a = 1;\n/* one\ntwo\nthree */\nlet b = 2;\n"
+
+@test("an edit inside a block comment re-colours the lines below it: closing it early, and erasing its close")
+colour_edit_comment()
+    val (dir, ed0) = fixture("a.rs", rust)
+    var ed = ed0
+    var g = drawn(&ed)
+    val comment = fg_of(g, 1, "one")
+
+    assert_eq(fg_of(g, 2, "two"), comment)
+    assert_eq(fg_of(g, 4, "let"), MAGENTA)
+
+    // `*/` typed after "one" closes the comment there: "two" and "three */" are code now.
+    key(&ed, Down)
+    key(&ed, End)
+    typed(&ed, " */")
+    g = drawn(&ed)
+    assert(fg_of(g, 2, "two") != comment, "the line below the edit kept its comment colour")
+    assert(fg_of(g, 3, "three") != comment)
+    assert_eq(fg_of(g, 4, "let"), MAGENTA)
+
+    // Erased again, the comment reaches "three */" again.
+    for _ in 0..<3 do key(&ed, Backspace)
+    g = drawn(&ed)
+    assert_eq(fg_of(g, 2, "two"), comment)
+    assert_eq(fg_of(g, 3, "three"), comment)
+    assert_eq(fg_of(g, 4, "let"), MAGENTA)
+
+    // The `*/` on "three */" erased, the comment runs on over the line below.
+    key(&ed, Down)
+    key(&ed, Down)
+    key(&ed, End)
+    key(&ed, Backspace)
+    key(&ed, Backspace)
+    g = drawn(&ed)
+    assert_eq(fg_of(g, 4, "let"), comment)
+
+    // An undo puts the `*/` back, and the line below is code again.
+    ctrl(&ed, CtrlZ)
+    assert_eq(fg_of(drawn(&ed), 4, "let"), MAGENTA)
+    remove_dir_all(dir).unwrap()
+
+@test("an edit that opens and closes nothing re-tokenizes its own line, and the lines below come back as they were")
+colour_edit_rejoins()
+    var text: Buf[u8] = buf()
+
+    for i in 0..<10 do text.extend(s"let v$i = $i;\n".bytes)
+
+    val (dir, ed0) = fixture("a.rs", from_utf8(text.view()).unwrap())
+    var ed = ed0
+
+    drawn(&ed)
+    assert_eq(ed.colours.tokenized, 10, "the first screen tokenizes each line once")
+    drawn(&ed)
+    assert_eq(ed.colours.tokenized, 10, "a second frame tokenizes nothing")
+
+    key(&ed, Down)
+    key(&ed, Down)
+    typed(&ed, "x")
+    var g = drawn(&ed)
+    assert_eq(ed.colours.tokenized, 11, "one line again: the line below it starts in the state it did")
+    assert_eq(fg_of(g, 3, "let"), MAGENTA)
+    assert_eq(fg_of(g, 9, "let"), MAGENTA)
+    assert_eq(g.row(9).index_of("let"), g.row(0).index_of("let"), "held lines are drawn where their text is now")
+
+    // A line break splits the line: two new lines, and the rest come back.
+    key(&ed, Enter)
+    g = drawn(&ed)
+    assert_eq(ed.colours.tokenized, 13)
+    assert_eq(fg_of(g, 9, "let"), MAGENTA)
+
+    // A deletion that joins two lines.
+    key(&ed, Backspace)
+    g = drawn(&ed)
+    assert_eq(ed.colours.tokenized, 14)
+    assert_eq(fg_of(g, 3, "let"), MAGENTA)
+
+    // A paste of a whole line at the top: that line and the one it pushed down, and the rest come back.
+    ctrl(&ed, Home)
+    ed.handle(Press(Down, false, true))
+    ctrl(&ed, CtrlC)
+    key(&ed, Up)
+    ctrl(&ed, CtrlV)
+    g = drawn(&ed)
+    assert_eq(ed.colours.tokenized, 16)
+    assert_eq(g.row(1).index_of("let v0"), g.row(0).index_of("let v0"))
+    assert(g.row(9).contains("let v8"), g.row(9))
+    assert_eq(fg_of(g, 9, "let"), MAGENTA)
+
+    // A replace-all changes every line, each edit moving the held lines below it.
+    key(&ed, CtrlR)
+    typed(&ed, "let")
+    key(&ed, Enter)
+    typed(&ed, "const")
+    key(&ed, Enter)
+    ed.finish()
+    ed.handle(Type('a'))
+    ed.finish()
+    g = drawn(&ed)
+    assert(g.row(9).contains("const v8"), g.row(9))
+    assert_eq(fg_of(g, 0, "const"), MAGENTA)
+    assert_eq(fg_of(g, 9, "const"), MAGENTA)
+    assert_eq(fg_of(g, 9, "8;"), RED)
+    remove_dir_all(dir).unwrap()
+
+@test("an unclosed block comment in sysl nests: the first */ inside a nested one does not close it")
+colour_sysl_nesting()
+    val (dir, ed0) = fixture("a.sysl", "/* a /* b */ still\nmore */ val x = 1\n")
+    var ed = ed0
+    val g = drawn(&ed)
+    val comment = fg_of(g, 0, "a")
+
+    assert_eq(fg_of(g, 0, "still"), comment)
+    assert_eq(fg_of(g, 1, "more"), comment)
+    assert(fg_of(g, 1, "val") != comment)
+    remove_dir_all(dir).unwrap()
+
+// ---- what a frame reads ------------------------------------------------------------------------
+
+@test("a block comment opened more than 64 KiB above the screen is not seen; one opened within it is")
+colour_scan_back()
+    for (gap, seen) in [(1000, true), (70000, false)]
+        var text: Buf[u8] = buf()
+
+        text.extend("/*\n".bytes)
+        for _ in 0..<gap / 10 do text.extend("123456789\n".bytes)
+        text.extend("*/ let x = 1;\nlet y = 2;\n".bytes)
+
+        val (dir, ed0) = fixture("a.rs", from_utf8(text.view()).unwrap())
+        var ed = ed0
+
+        ed.goto(u64(gap / 10), 0)
+        ed.top = u64(gap / 10)
+
+        val g = drawn(&ed)
+
+        assert(g.row(1).contains("*/ let x"), g.row(1))
+        assert_eq(fg_of(g, 0, "123"), if seen then CYAN else RED, s"gap $gap")
+        assert_eq(fg_of(g, 2, "let"), MAGENTA, "the code below is code either way")
+        remove_dir_all(dir).unwrap()
+
+@test("scrolling down goes on from the lines kept, and up within the kept lines tokenizes nothing")
+colour_scroll()
+    var text: Buf[u8] = buf()
+
+    text.extend("/*\n".bytes)
+    for i in 0..<100 do text.extend(s"c$i\n".bytes)
+    text.extend("*/\n".bytes)
+    for i in 0..<100 do text.extend(s"let v$i = $i;\n".bytes)
+
+    val (dir, ed0) = fixture("a.rs", from_utf8(text.view()).unwrap())
+    var ed = ed0
+    var g = drawn(&ed)
+    val comment = fg_of(g, 1, "c0")
+
+    for _ in 0..<20 do key(&ed, PageDown)
+    g = drawn(&ed)
+    assert_eq(fg_of(g, 0, "let"), MAGENTA)
+
+    val before = ed.colours.tokenized
+
+    key(&ed, PageUp)
+    drawn(&ed)
+    assert_eq(ed.colours.tokenized, before, "the lines above were kept")
+
+    ctrl(&ed, Home)
+    for _ in 0..<5 do key(&ed, PageDown)
+    g = drawn(&ed)
+    assert_eq(fg_of(g, 0, "c"), comment)
+    remove_dir_all(dir).unwrap()
+
+@test("a line over the long-line limit is not tokenized, and the line after it is coloured from a fresh start")
+colour_long_line()
+    var text: Buf[u8] = buf()
+
+    text.extend("x = \"".bytes)
+    for _ in 0..<(long_line + 10) do text.push(u8('a'))
+    text.extend("\nx = 1\n".bytes)
+
+    val (dir, ed0) = fixture("a.py", from_utf8(text.view()).unwrap())
+    var ed = ed0
+    val g = drawn(&ed)
+
+    assert_eq(g.at(int(g.row(0).index_of("\"").unwrap()), 0).fg, DEFAULT)
+    assert_eq(fg_of(g, 1, "1"), RED, "the unclosed string on the long line does not reach the next")
+    remove_dir_all(dir).unwrap()
+
+@test("a line that is not UTF-8 is drawn plain and passes its state on")
+colour_not_utf8()
+    val dir = make_temp_dir("te-colour").unwrap()
+    val file = s"$dir/a.rs"
+    var f = create(file).unwrap()
+
+    f.write("/* open\n".bytes)
+    f.write([u8('b'), 0xff, u8('\n')])
+    f.write("still */ let x = 1;\n".bytes)
+    f.close().unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(60, 12))
+
+    val g = drawn(&ed)
+    val comment = fg_of(g, 0, "open")
+
+    assert_eq(g.at(int(g.row(1).index_of("b").unwrap()), 1).fg, DEFAULT)
+    assert_eq(fg_of(g, 2, "still"), comment)
+    assert_eq(fg_of(g, 2, "let"), MAGENTA)
+    remove_dir_all(dir).unwrap()
+
+@test("CRLF lines are coloured as their text, with no CR in a token")
+colour_crlf()
+    val (dir, ed0) = fixture("a.py", "def f():\r\n    return 1\r\n")
+    var ed = ed0
+    val g = drawn(&ed)
+
+    assert_eq(fg_of(g, 0, "def"), MAGENTA)
+    assert_eq(fg_of(g, 1, "return"), MAGENTA)
+    assert_eq(fg_of(g, 1, "1"), RED)
+    remove_dir_all(dir).unwrap()
+
+@test("a 20 MB source file's first screen is coloured and still reads one piece")
+colour_huge()
+    val dir = make_temp_dir("te-colour").unwrap()
+    val file = s"$dir/big.py"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    while chunk.len() < 1 << 20 do chunk.extend("def f(x): return x + 1  # a comment, then more text\n".bytes)
+    for _ in 0..<20 do f.write(chunk.view())
+    f.close().unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(80, 12))
+
+    val g = drawn(&ed)
+
+    assert_eq(fg_of(g, 0, "def"), MAGENTA)
+    assert_eq(fg_of(g, 9, "# a"), CYAN)
+    assert_eq(ed.text.scanned, 1 << 20)
+    assert_eq(ed.colours.tokenized, 10)
+
+    // Ctrl+End before the lines are counted: the far screen is coloured, from at most 64 KiB above it.
+    ctrl(&ed, End)
+
+    val far = drawn(&ed)
+    val line = u64("def f(x): return x + 1  # a comment, then more text\n".len)
+
+    assert(ed.far)
+    assert_eq(fg_of(far, 0, "def"), MAGENTA)
+    assert_eq(fg_of(far, 0, "# a"), CYAN)
+    assert(ed.colours.tokenized - 10 <= scan_back / line + 10, s"tokenized ${ed.colours.tokenized - 10}")
+    remove_dir_all(dir).unwrap()
+
+@test("a last line with no line break is tokenized again when typed at its end")
+colour_last_line()
+    val (dir, ed0) = fixture("a.rs", "/* a\nb")
+    var ed = ed0
+    val comment = fg_of(drawn(&ed), 1, "b")
+
+    key(&ed, Down)
+    key(&ed, End)
+    typed(&ed, " */ let")
+
+    val g = drawn(&ed)
+
+    assert_eq(fg_of(g, 1, "b"), comment)
+    assert_eq(fg_of(g, 1, "let"), MAGENTA)
+    remove_dir_all(dir).unwrap()
