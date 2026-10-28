@@ -1,0 +1,797 @@
+@tests
+
+// The editor driven without a terminal: keys in, the cursor, the text and the drawn grid out.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text, create}
+import sysl.text.from_utf8
+import sysl.time.monotonic
+import sh.sysl.termbox2.{Event, Keyboard, Mouse, Resize, UnknownEvent, Key, REVERSE}
+import sh.sysl.termbox2.c.MOD_CTRL
+
+/** An editor over `text` in a file of its own, on a screen 40 by 10 (8 rows of text). */
+private fixture(text: string, w: int = 40, h: int = 10) -> (string, Editor)
+    val dir = make_temp_dir("te-editor").unwrap()
+    val file = s"$dir/f.txt"
+
+    write_text(file, text).unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(w, h))
+    (dir, ed)
+
+private key(ed: *Editor, k: Key) = ed.handle(Press(k, false))
+
+private ctrl(ed: *Editor, k: Key) = ed.handle(Press(k, true))
+
+private typed(ed: *Editor, s: string)
+    for c in s.chars do ed.handle(Type(c))
+
+private all(ed: *Editor) -> string = from_utf8(ed.text.bytes(0, ed.text.size()).view()).unwrap()
+
+/** The cursor is at `at` on `line`, and the line the editor keeps is the one the core finds for it. */
+private cursor_is(ed: *Editor, at: u64, line: u64)
+    assert_eq((ed.at, ed.line), (at, line))
+    assert_eq(ed.text.line_of(ed.at), ed.line, "the kept line disagrees with the text")
+
+private screen_col(ed: *Editor) -> u64 = ed.column(ed.line, ed.at).0
+
+private drawn(ed: *Editor) -> Grid
+    var g = grid()
+
+    ed.render(&g)
+    g
+
+// ---- moving over what a line can hold -------------------------------------------------------
+
+@test("a wide character is two columns: the cursor steps over it in one move, and it is drawn in two cells")
+ed_wide()
+    var (dir, ed) = fixture("a中b\n")
+
+    var g = drawn(&ed)
+
+    assert_eq(g.row(0), "1 a中b")
+    assert_eq(g.at(3, 0).ch, u32('中'))
+    assert_eq(g.at(4, 0).ch, 0)
+    assert_eq(g.cursor, Some((2, 0)))
+
+    key(&ed, Right)
+    key(&ed, Right)
+    cursor_is(&ed, 4, 0)
+    assert_eq(screen_col(&ed), 3)
+    g = drawn(&ed)
+    assert_eq(g.cursor, Some((5, 0)))
+
+    key(&ed, Right)
+    cursor_is(&ed, 5, 0)
+    key(&ed, Left)
+    key(&ed, Left)
+    cursor_is(&ed, 1, 0)
+    remove_dir_all(dir).unwrap()
+
+@test("a click on either half of a wide character puts the cursor before it")
+ed_wide_click()
+    var (dir, ed) = fixture("a中b\n")
+
+    ed.handle(Click(4, 0))
+    cursor_is(&ed, 1, 0)
+    ed.handle(Click(3, 0))
+    cursor_is(&ed, 1, 0)
+    ed.handle(Click(5, 0))
+    cursor_is(&ed, 4, 0)
+    remove_dir_all(dir).unwrap()
+
+@test("a tab reaches the next multiple of the tab width, and a goal column inside one lands before it")
+ed_tabs()
+    var (dir, ed) = fixture("\tx\nabcdefgh\nab\n")
+
+    assert_eq(drawn(&ed).row(0), "1     x")
+    key(&ed, Right)
+    cursor_is(&ed, 1, 0)
+    assert_eq(screen_col(&ed), 4)
+
+    key(&ed, Down)
+    cursor_is(&ed, 7, 1)
+    key(&ed, End)
+    assert_eq(screen_col(&ed), 8)
+    key(&ed, Up)
+    cursor_is(&ed, 2, 0)
+    key(&ed, Down)
+    cursor_is(&ed, 11, 1)
+
+    key(&ed, Down)
+    key(&ed, Home)
+    key(&ed, Right)
+    key(&ed, Right)
+    cursor_is(&ed, 14, 2)
+    key(&ed, Up)
+    key(&ed, Up)
+    cursor_is(&ed, 0, 0)
+    key(&ed, Down)
+    key(&ed, Down)
+    cursor_is(&ed, 14, 2)
+    remove_dir_all(dir).unwrap()
+
+@test("a tab width other than four is honoured")
+ed_tab_width()
+    val dir = make_temp_dir("te-editor").unwrap()
+
+    write_text(s"$dir/f.txt", "a\tb").unwrap()
+
+    var ed = editor(open(s"$dir/f.txt").unwrap(), 40, 10, 8)
+
+    key(&ed, End)
+    assert_eq(screen_col(&ed), 9)
+    assert_eq(drawn(&ed).row(0), "1 a       b")
+    remove_dir_all(dir).unwrap()
+
+@test("the goal column is kept over a short line and dropped by a move along the line")
+ed_goal()
+    var (dir, ed) = fixture("abcdef\nab\nabcdef\n")
+
+    key(&ed, End)
+    key(&ed, Left)
+    key(&ed, Down)
+    cursor_is(&ed, 9, 1)
+    key(&ed, Down)
+    cursor_is(&ed, 15, 2)
+
+    key(&ed, Up)
+    key(&ed, Left)
+    key(&ed, Down)
+    cursor_is(&ed, 11, 2)
+    remove_dir_all(dir).unwrap()
+
+@test("a combining mark goes with the character before it, and Backspace takes it alone")
+ed_combining()
+    var (dir, ed) = fixture("e\u{301}x\n")
+
+    key(&ed, Right)
+    cursor_is(&ed, 3, 0)
+    assert_eq(screen_col(&ed), 1)
+    key(&ed, Left)
+    cursor_is(&ed, 0, 0)
+
+    key(&ed, Right)
+    key(&ed, Backspace2)
+    assert_eq(all(&ed), "ex\n")
+    cursor_is(&ed, 1, 0)
+
+    key(&ed, CtrlZ)
+    key(&ed, Home)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "x\n")
+    remove_dir_all(dir).unwrap()
+
+@test("a CRLF is one line break: End stops before it, Right and Backspace cross it whole, Enter keeps it")
+ed_crlf()
+    var (dir, ed) = fixture("ab\r\ncd\r\n")
+
+    key(&ed, End)
+    cursor_is(&ed, 2, 0)
+    key(&ed, Right)
+    cursor_is(&ed, 4, 1)
+    key(&ed, Left)
+    cursor_is(&ed, 2, 0)
+    key(&ed, Down)
+    key(&ed, Home)
+    key(&ed, Backspace2)
+    assert_eq(all(&ed), "abcd\r\n")
+    cursor_is(&ed, 2, 0)
+
+    key(&ed, Enter)
+    assert_eq(all(&ed), "ab\r\ncd\r\n")
+    cursor_is(&ed, 4, 1)
+
+    key(&ed, End)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "ab\r\ncd")
+    remove_dir_all(dir).unwrap()
+
+@test("empty lines are walked one at a time, and nothing moves past the first or the last")
+ed_empty_lines()
+    var (dir, ed) = fixture("\n\n\n")
+
+    key(&ed, Up)
+    key(&ed, Left)
+    cursor_is(&ed, 0, 0)
+    key(&ed, Right)
+    cursor_is(&ed, 1, 1)
+    key(&ed, Down)
+    key(&ed, Down)
+    cursor_is(&ed, 3, 3)
+    key(&ed, Down)
+    key(&ed, Right)
+    cursor_is(&ed, 3, 3)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "\n\n\n")
+
+    ctrl(&ed, Home)
+    key(&ed, Backspace2)
+    assert_eq(all(&ed), "\n\n\n")
+    remove_dir_all(dir).unwrap()
+
+@test("an empty file is one empty line, and every key that has nothing to act on does nothing")
+ed_empty_file()
+    var (dir, ed) = fixture("")
+
+    val keys: []Key = [Left, Right, Up, Down, Home, End, PageUp, PageDown, Backspace2, Delete]
+
+    for k in keys do key(&ed, k)
+    ctrl(&ed, End)
+    ctrl(&ed, Left)
+    ctrl(&ed, Right)
+    key(&ed, CtrlZ)
+    key(&ed, CtrlY)
+    cursor_is(&ed, 0, 0)
+    assert_eq(all(&ed), "")
+    assert(!ed.text.modified())
+    assert_eq(drawn(&ed).row(0), "1")
+    assert_eq(drawn(&ed).row(1), "")
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+arrows move by word, across punctuation, and over a line break at either end")
+ed_words()
+    var (dir, ed) = fixture("foo, bar_1 (baz)\nqux\n")
+
+    ctrl(&ed, Right)
+    cursor_is(&ed, 3, 0)
+    ctrl(&ed, Right)
+    cursor_is(&ed, 10, 0)
+    ctrl(&ed, Right)
+    cursor_is(&ed, 15, 0)
+    ctrl(&ed, Right)
+    cursor_is(&ed, 16, 0)
+    ctrl(&ed, Right)
+    cursor_is(&ed, 17, 1)
+    ctrl(&ed, Left)
+    cursor_is(&ed, 16, 0)
+    ctrl(&ed, Left)
+    cursor_is(&ed, 12, 0)
+    ctrl(&ed, Left)
+    cursor_is(&ed, 5, 0)
+    ctrl(&ed, Left)
+    cursor_is(&ed, 0, 0)
+    remove_dir_all(dir).unwrap()
+
+@test("Home goes to the end of the indentation and then to the line start; Ctrl+Home and Ctrl+End to the ends")
+ed_home_end()
+    var (dir, ed) = fixture("a\n    indented\nlast")
+
+    key(&ed, Down)
+    key(&ed, End)
+    key(&ed, Home)
+    cursor_is(&ed, 6, 1)
+    key(&ed, Home)
+    cursor_is(&ed, 2, 1)
+    key(&ed, Home)
+    cursor_is(&ed, 6, 1)
+
+    ctrl(&ed, End)
+    cursor_is(&ed, 19, 2)
+    ctrl(&ed, Home)
+    cursor_is(&ed, 0, 0)
+    remove_dir_all(dir).unwrap()
+
+// ---- the view ---------------------------------------------------------------------------------
+
+private numbered(n: u64, width: u64 = 0) -> string
+    var out: Buf[u8] = buf()
+
+    for i in 0..<n
+        out.extend(s"line $i".bytes)
+        for _ in 0..<width do out.push(u8('.'))
+        out.push(u8('\n'))
+
+    from_utf8(out.view()).unwrap()
+
+@test("the view follows the cursor down and up a page and to the ends, and draws only the rows that fit")
+ed_viewport()
+    var (dir, ed) = fixture(numbered(100))
+
+    for _ in 0..<8 do key(&ed, Down)
+    assert_eq(ed.top, 1)
+    key(&ed, PageDown)
+    cursor_is(&ed, ed.text.line_start(16), 16)
+    assert_eq(ed.top, 9)
+
+    ctrl(&ed, End)
+    cursor_is(&ed, ed.text.size(), 100)
+    assert_eq(ed.top, 93)
+
+    var g = drawn(&ed)
+
+    assert_eq(g.row(0), " 94 line 93")
+    assert_eq(g.row(7), "101")
+    assert_eq(g.cursor, Some((4, 7)))
+
+    key(&ed, PageUp)
+    assert_eq(ed.line, 92)
+    assert_eq(ed.top, 85)
+    ctrl(&ed, Home)
+    assert_eq(ed.top, 0)
+    assert_eq(drawn(&ed).row(0), "  1 line 0")
+    remove_dir_all(dir).unwrap()
+
+@test("a long line scrolls sideways to keep the cursor on screen, and back")
+ed_horizontal()
+    var (dir, ed) = fixture(numbered(3, 100))
+
+    key(&ed, End)
+    assert_eq(screen_col(&ed), 106)
+
+    var g = drawn(&ed)
+
+    assert_eq(ed.left, 106 - 38 + 1)
+    assert_eq(g.cursor, Some((39, 0)))
+    assert_eq(g.row(1), "2 .....................................")
+
+    key(&ed, Home)
+    assert_eq(ed.left, 0)
+    assert_eq(drawn(&ed).cursor, Some((2, 0)))
+    remove_dir_all(dir).unwrap()
+
+@test("the gutter grows with the line numbers on screen, and with the line total once it is known")
+ed_gutter()
+    var (dir, ed) = fixture(numbered(5))
+
+    assert_eq(ed.gutter(), 2)
+    assert_eq(drawn(&ed).row(5), "6")
+    assert_eq(drawn(&ed).row(6), "")
+    ed.text.line_count()
+    assert_eq(ed.gutter(), 2)
+    remove_dir_all(dir).unwrap()
+
+    var (big, b) = fixture(numbered(1000))
+
+    assert_eq(b.gutter(), 2)
+    b.text.line_count()
+    assert_eq(b.gutter(), 5)
+    assert_eq(drawn(&b).row(0), "   1 line 0")
+    remove_dir_all(big).unwrap()
+
+@test("a resize keeps the cursor on screen and redraws at the new size")
+ed_resize()
+    var (dir, ed) = fixture(numbered(50))
+
+    for _ in 0..<7 do key(&ed, Down)
+    assert_eq(ed.top, 0)
+    ed.handle(Resized(20, 5))
+    assert_eq(ed.top, 5)
+
+    val g = drawn(&ed)
+
+    assert_eq((g.w, g.h), (20, 5))
+    assert_eq(g.cursor, Some((2, 2)))
+    remove_dir_all(dir).unwrap()
+
+@test("the wheel scrolls the view without moving the cursor, and stops at either end")
+ed_wheel()
+    var (dir, ed) = fixture(numbered(20))
+
+    ed.handle(Wheel(3))
+    assert_eq(ed.top, 3)
+    cursor_is(&ed, 0, 0)
+    assert_eq(drawn(&ed).cursor, None)
+    ed.handle(Wheel(-10))
+    assert_eq(ed.top, 0)
+    ed.handle(Wheel(100))
+    assert_eq(ed.top, 20)
+    remove_dir_all(dir).unwrap()
+
+@test("a click places the cursor at that row and column, at a line's end past it, and on the last line below the text")
+ed_click()
+    var (dir, ed) = fixture("hello\nworld\n")
+
+    ed.handle(Click(5, 1))
+    cursor_is(&ed, 9, 1)
+    ed.handle(Click(30, 0))
+    cursor_is(&ed, 5, 0)
+    ed.handle(Click(0, 1))
+    cursor_is(&ed, 6, 1)
+    ed.handle(Click(3, 6))
+    cursor_is(&ed, 12, 2)
+    ed.handle(Click(3, 9))
+    cursor_is(&ed, 12, 2)
+    remove_dir_all(dir).unwrap()
+
+@test("the status bar names the file, says it is modified, and where the cursor is; the key bar shows the keys that work")
+ed_status()
+    var (dir, ed) = fixture("ab\ncd\n", 200)
+    val name = s"$dir/f.txt"
+
+    var g = drawn(&ed)
+
+    assert(g.row(8).starts_with(s" $name"))
+    assert(g.row(8).ends_with("Ln 1 of 3, Col 1"), "a file the first screen reaches the end of has its total")
+    assert_eq(g.row(9), "^S Save  ^Q Quit  ^G Go to line  ^Z Undo  ^Y Redo")
+    assert_eq(g.at(0, 9).fg & REVERSE, REVERSE)
+
+    key(&ed, Down)
+    typed(&ed, "x")
+    g = drawn(&ed)
+    assert(g.row(8).starts_with(s" $name (modified)"))
+    assert(g.row(8).ends_with("Ln 2 of 3, Col 2"))
+    key(&ed, Enter)
+    assert(drawn(&ed).row(8).ends_with("Ln 3 of 4, Col 1"))
+    remove_dir_all(dir).unwrap()
+
+// ---- editing ----------------------------------------------------------------------------------
+
+@test("typing inserts at the cursor, and undo and redo put the cursor back where each edit was made")
+ed_typing_undo()
+    var (dir, ed) = fixture("one\ntwo\n")
+
+    key(&ed, Down)
+    key(&ed, Right)
+    typed(&ed, "XY")
+    assert_eq(all(&ed), "one\ntXYwo\n")
+    cursor_is(&ed, 7, 1)
+
+    ctrl(&ed, Home)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "one\ntXwo\n")
+    cursor_is(&ed, 6, 1)
+    key(&ed, CtrlZ)
+    assert_eq(all(&ed), "one\ntwo\n")
+    cursor_is(&ed, 5, 1)
+    assert(!ed.text.modified())
+    key(&ed, CtrlZ)
+    cursor_is(&ed, 5, 1)
+
+    ctrl(&ed, End)
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "one\ntXwo\n")
+    cursor_is(&ed, 6, 1)
+
+    typed(&ed, "中")
+    assert_eq(all(&ed), "one\ntX中wo\n")
+    key(&ed, CtrlY)
+    assert_eq(all(&ed), "one\ntX中wo\n", "a redo after a new edit")
+    key(&ed, CtrlZ)
+    cursor_is(&ed, 6, 1)
+    key(&ed, CtrlZ)
+    key(&ed, CtrlY)
+    cursor_is(&ed, 6, 1)
+    remove_dir_all(dir).unwrap()
+
+@test("undo puts back the line a join or a split moved the cursor across")
+ed_undo_lines()
+    var (dir, ed) = fixture("ab\ncd\n")
+
+    key(&ed, Down)
+    key(&ed, Backspace2)
+    cursor_is(&ed, 2, 0)
+    key(&ed, Enter)
+    key(&ed, Enter)
+    cursor_is(&ed, 4, 2)
+    key(&ed, CtrlZ)
+    cursor_is(&ed, 3, 1)
+    key(&ed, CtrlZ)
+    cursor_is(&ed, 2, 0)
+    key(&ed, CtrlZ)
+    cursor_is(&ed, 3, 1)
+    assert_eq(all(&ed), "ab\ncd\n")
+    remove_dir_all(dir).unwrap()
+
+@test("Enter keeps the line's indentation, spaces or tabs, but no more of it than is before the cursor")
+ed_indent()
+    var (dir, ed) = fixture("    foo\n\t\tbar\n")
+
+    key(&ed, End)
+    key(&ed, Enter)
+    assert_eq(all(&ed), "    foo\n    \n\t\tbar\n")
+    cursor_is(&ed, 12, 1)
+    typed(&ed, "x")
+
+    key(&ed, Down)
+    key(&ed, End)
+    key(&ed, Enter)
+    assert_eq(all(&ed), "    foo\n    x\n\t\tbar\n\t\t\n")
+    cursor_is(&ed, 22, 3)
+
+    ctrl(&ed, Home)
+    key(&ed, Right)
+    key(&ed, Right)
+    key(&ed, Enter)
+    assert_eq(all(&ed), "  \n    foo\n    x\n\t\tbar\n\t\t\n")
+    cursor_is(&ed, 5, 1)
+    remove_dir_all(dir).unwrap()
+
+@test("Tab and Space insert themselves; Backspace and Delete join lines")
+ed_tab_space_join()
+    var (dir, ed) = fixture("ab\ncd")
+
+    key(&ed, Tab)
+    key(&ed, Space)
+    assert_eq(all(&ed), "\t ab\ncd")
+    key(&ed, End)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "\t abcd")
+    cursor_is(&ed, 4, 0)
+    key(&ed, End)
+    key(&ed, Delete)
+    assert_eq(all(&ed), "\t abcd")
+    remove_dir_all(dir).unwrap()
+
+// ---- saving and quitting ----------------------------------------------------------------------
+
+@test("Ctrl+S saves to the file and the modified marker goes")
+ed_save()
+    var (dir, ed) = fixture("abc", 200)
+
+    typed(&ed, "x")
+    key(&ed, CtrlS)
+    assert_eq(read_text(s"$dir/f.txt").unwrap(), "xabc")
+    assert(!ed.text.modified())
+    assert_eq(ed.message, s"Saved $dir/f.txt")
+    assert(drawn(&ed).row(8).starts_with(s" Saved $dir/f.txt"))
+    key(&ed, Right)
+    assert(drawn(&ed).row(8).starts_with(s" $dir/f.txt  "), "the message lasts until the next key")
+    remove_dir_all(dir).unwrap()
+
+@test("a save that fails says why in the status bar, and the text stays modified")
+ed_save_error()
+    val dir = make_temp_dir("te-editor").unwrap()
+    val file = s"$dir/missing/f.txt"
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(200, 10))
+    assert_eq(ed.message, s"New file $file")
+    typed(&ed, "hi")
+    key(&ed, CtrlS)
+    assert(ed.message.starts_with(s"Could not save $file: "), ed.message)
+    assert(drawn(&ed).row(8).starts_with(s" Could not save $file"))
+    assert(ed.text.modified())
+    assert(!ed.done)
+
+    key(&ed, CtrlQ)
+    typed(&ed, "y")
+    assert(!ed.done, "a failed save does not quit")
+    assert(ed.prompt == Idle)
+    assert(ed.message.starts_with("Could not save"))
+    remove_dir_all(dir).unwrap()
+
+@test("a path that is not there is a new file, written on the first save")
+ed_new_file()
+    val dir = make_temp_dir("te-editor").unwrap()
+    val file = s"$dir/new.txt"
+    var ed = load(file).unwrap()
+
+    assert(!ed.text.modified())
+    typed(&ed, "fresh")
+    key(&ed, Enter)
+    key(&ed, CtrlS)
+    assert_eq(read_text(file).unwrap(), "fresh\n")
+    remove_dir_all(dir).unwrap()
+
+@test("a path that cannot be opened is an error before the screen starts")
+ed_load_error()
+    val dir = make_temp_dir("te-editor").unwrap()
+
+    load(dir) match
+        Ok(_) -> assert(false, "a directory opened as a file")
+        Err(e) -> assert(e.starts_with(s"$dir: "), e)
+    remove_dir_all(dir).unwrap()
+
+@test("an unnamed buffer asks for a name on Ctrl+S; Esc and an empty name save nothing")
+ed_unnamed()
+    val dir = make_temp_dir("te-editor").unwrap()
+    var ed = load("").unwrap()
+
+    ed.handle(Resized(200, 10))
+    assert(drawn(&ed).row(8).starts_with(" [No name]"))
+    typed(&ed, "text")
+    key(&ed, CtrlS)
+    assert(ed.prompt == Naming)
+    typed(&ed, "abc")
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+
+    key(&ed, CtrlS)
+    assert_eq(drawn(&ed).row(9), "Enter Save  Esc Cancel")
+    key(&ed, Enter)
+    assert_eq(ed.message, "Not saved")
+
+    key(&ed, CtrlS)
+    typed(&ed, s"$dir/x.tx")
+    typed(&ed, "q")
+    key(&ed, Backspace2)
+    typed(&ed, "t")
+
+    val g = drawn(&ed)
+
+    assert_eq(g.row(8), s" Save as: $dir/x.txt")
+    assert_eq(g.cursor, Some((int(10 + s"$dir/x.txt".len), 8)))
+    key(&ed, Enter)
+    assert_eq(read_text(s"$dir/x.txt").unwrap(), "text")
+    assert_eq(ed.text.path, s"$dir/x.txt")
+    assert(!ed.done)
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+Q quits at once when nothing is modified")
+ed_quit_clean()
+    var (dir, ed) = fixture("abc")
+
+    key(&ed, CtrlQ)
+    assert(ed.done)
+    remove_dir_all(dir).unwrap()
+
+@test("Ctrl+Q with changes asks: Esc goes back, N quits without saving, Y saves and quits")
+ed_quit_prompt()
+    var (dir, ed) = fixture("abc")
+
+    typed(&ed, "x")
+    key(&ed, CtrlQ)
+    assert(ed.prompt == Quitting)
+    assert(!ed.done)
+
+    val g = drawn(&ed)
+
+    assert(g.row(8).starts_with(" Save changes before quitting?"))
+    assert_eq(g.row(9), "Y Yes  N No  Esc Cancel")
+
+    typed(&ed, "q")
+    key(&ed, Left)
+    assert(ed.prompt == Quitting, "another key is not an answer")
+    assert_eq(all(&ed), "xabc")
+    key(&ed, Esc)
+    assert(ed.prompt == Idle)
+    assert(!ed.done)
+
+    key(&ed, CtrlQ)
+    typed(&ed, "n")
+    assert(ed.done)
+    assert_eq(read_text(s"$dir/f.txt").unwrap(), "abc")
+
+    var (dir2, ed2) = fixture("abc")
+
+    typed(&ed2, "y")
+    key(&ed2, CtrlQ)
+    typed(&ed2, "Y")
+    assert(ed2.done)
+    assert_eq(read_text(s"$dir2/f.txt").unwrap(), "yabc")
+    remove_dir_all(dir).unwrap()
+    remove_dir_all(dir2).unwrap()
+
+@test("Y on an unnamed buffer asks for a name, then quits once it is saved")
+ed_quit_unnamed()
+    val dir = make_temp_dir("te-editor").unwrap()
+    var ed = load("").unwrap()
+
+    typed(&ed, "t")
+    key(&ed, CtrlQ)
+    typed(&ed, "y")
+    assert(ed.prompt == Naming)
+    assert(!ed.done)
+    typed(&ed, s"$dir/q.txt")
+    key(&ed, Enter)
+    assert(ed.done)
+    assert_eq(read_text(s"$dir/q.txt").unwrap(), "t")
+    remove_dir_all(dir).unwrap()
+
+// ---- go to line -------------------------------------------------------------------------------
+
+@test("Ctrl+G goes to a line, or a line and column, and puts it in the middle of the screen")
+ed_goto()
+    var (dir, ed) = fixture(numbered(100))
+
+    key(&ed, CtrlG)
+    assert_eq(drawn(&ed).row(9), "Enter Go  Esc Cancel")
+    typed(&ed, "50")
+    assert_eq(drawn(&ed).row(8), " Go to line: 50")
+    key(&ed, Enter)
+    cursor_is(&ed, ed.text.line_start(49), 49)
+    assert_eq(ed.top, 45)
+
+    key(&ed, CtrlG)
+    typed(&ed, "3:4")
+    key(&ed, Enter)
+    cursor_is(&ed, ed.text.line_start(2) + 3, 2)
+
+    key(&ed, CtrlG)
+    typed(&ed, "3:400")
+    key(&ed, Enter)
+    cursor_is(&ed, ed.text.line_end(2), 2)
+
+    key(&ed, CtrlG)
+    typed(&ed, "5000")
+    key(&ed, Enter)
+    cursor_is(&ed, ed.text.size(), 100)
+    remove_dir_all(dir).unwrap()
+
+@test("a go-to that is not a line number says so and leaves the cursor; Esc cancels")
+ed_goto_errors()
+    var (dir, ed) = fixture(numbered(10))
+
+    key(&ed, Down)
+    for bad in ["", "0", "x", "-3", "2:0", "1:2:3", "2:x"]
+        key(&ed, CtrlG)
+        typed(&ed, bad)
+        key(&ed, Enter)
+        assert_eq(ed.message, s"Not a line number: $bad")
+        assert(ed.prompt == Idle)
+        cursor_is(&ed, 7, 1)
+
+    key(&ed, CtrlG)
+    typed(&ed, "5")
+    key(&ed, Esc)
+    cursor_is(&ed, 7, 1)
+    assert(ed.prompt == Idle)
+    remove_dir_all(dir).unwrap()
+
+// ---- a large file -----------------------------------------------------------------------------
+
+const big_lines: u64 = 200_000
+
+@test("a 20 MB file shows its first screen reading one piece, and a go-to near its end is fast")
+ed_big_file()
+    val dir = make_temp_dir("te-editor").unwrap()
+    val file = s"$dir/big.txt"
+    var f = create(file).unwrap()
+    var chunk: Buf[u8] = buf()
+
+    for i in 0..<big_lines
+        val number = s"$i".bytes
+
+        for _ in number.len..<12 do chunk.push(u8('0'))
+        chunk.extend(number)
+        for _ in 12..<99 do chunk.push(u8('.'))
+        chunk.push(u8('\n'))
+
+    f.write(chunk.view())
+    f.close().unwrap()
+
+    var ed = load(file).unwrap()
+
+    ed.handle(Resized(120, 40))
+
+    var g = drawn(&ed)
+
+    assert_eq(ed.text.scanned, 1 << 20, "the first screen read more than its piece")
+    assert(g.row(0).starts_with(" 1 000000000000...."))
+    assert(!g.row(38).contains(" of "), "the line total was counted to be shown")
+
+    val start = monotonic().us
+
+    key(&ed, CtrlG)
+    typed(&ed, s"${big_lines - 3}")
+    key(&ed, Enter)
+    g = drawn(&ed)
+
+    val took = (monotonic().us - start) / 1000
+
+    assert_eq((ed.at, ed.line), ((big_lines - 4) * 100, big_lines - 4))
+    assert(took < 2000, s"going to the end took $took ms")
+    assert(g.row(19).starts_with(s"${big_lines - 3} 000000199996"), g.row(19))
+    assert_eq(g.cursor, Some((7, 19)))
+
+    typed(&ed, "X")
+    key(&ed, Down)
+    key(&ed, CtrlZ)
+    assert_eq((ed.at, ed.line), ((big_lines - 4) * 100, big_lines - 4))
+    remove_dir_all(dir).unwrap()
+
+// ---- the terminal's events --------------------------------------------------------------------
+
+private said(i: Option[Input]) -> string = i match
+    Some(Type(c)) -> s"type $c"
+    Some(Press(k, ctrl)) -> s"press $k $ctrl"
+    Some(Click(x, y)) -> s"click $x $y"
+    Some(Wheel(n)) -> s"wheel $n"
+    Some(Resized(w, h)) -> s"resize $w $h"
+    None -> "none"
+
+@test("termbox's events become the editor's input")
+ed_input_of()
+    assert_eq(said(input_of(Event(Keyboard, Nul, u32('é'), 0, 0, 0, 0, 0, 0))), "type é")
+    assert_eq(said(input_of(Event(Keyboard, Left, 0, 0, MOD_CTRL, 0, 0, 0, 0))), "press Left true")
+    assert_eq(said(input_of(Event(Keyboard, CtrlS, 0, 0, 0, 0, 0, 0, 0))), "press CtrlS false")
+    assert_eq(said(input_of(Event(Resize, Nul, 0, 0, 0, 100, 30, 0, 0))), "resize 100 30")
+    assert_eq(said(input_of(Event(Mouse, MouseLeft, 0, 0, 0, 0, 0, 7, 3))), "click 7 3")
+    assert_eq(said(input_of(Event(Mouse, MouseWheelUp, 0, 0, 0, 0, 0, 7, 3))), "wheel -3")
+    assert_eq(said(input_of(Event(Mouse, MouseWheelDown, 0, 0, 0, 0, 0, 7, 3))), "wheel 3")
+    assert_eq(said(input_of(Event(Mouse, MouseRelease, 0, 0, 0, 0, 0, 7, 3))), "none")
+    assert_eq(said(input_of(Event(UnknownEvent, Nul, 0, 0, 0, 0, 0, 0, 0))), "none")
+    assert_eq(said(input_of(Event(Keyboard, Nul, 0xD800, 0, 0, 0, 0, 0, 0))), "none")

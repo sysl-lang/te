@@ -1,0 +1,665 @@
+// The editor without the terminal: the cursor, the viewport, what each key does, and what the screen
+// shows, over a `Text`.
+//
+// **Only the rows on screen are ever read.** The cursor is a byte offset and the line it is on; both
+// are kept as it moves, so nothing asks the core which line an offset is on (which would count every
+// line before it). A move to another line asks where that line starts, which finds it without
+// counting the lines after it, so the view of a file of many gigabytes reads the pieces it shows.
+// The line total is shown once the core knows it, and never counted to be shown.
+//
+// **A column on screen is not a column in the text.** The core counts characters; the screen counts
+// cells, and a tab reaches to the next multiple of `tab`, an East Asian wide character takes two, a
+// combining mark none. The cursor moves over a character and the marks after it as one, and an up or
+// down move keeps the screen column it started from (`goal`) until a move along the line.
+//
+// Each edit is one version of the text, and the cursor before and after it is kept beside the
+// version, so an undo puts the cursor back where the edit was made.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, NotFound}
+import sysl.math.min
+import sysl.text.{chars_of, from_utf8_lossy, parse_ulong, split}
+import sh.sysl.termbox2.{Key, wcwidth, DEFAULT, REVERSE, DIM, BOLD}
+
+/** How many columns a tab reaches to a multiple of. */
+const tab_width: u64 = 4
+
+/** What the editor is told: the terminal's input, already named. */
+enum Input
+    /** A character typed. */
+    Type(c: char)
+    /** A key that is not a character, with whether Ctrl was held. */
+    Press(key: Key, ctrl: bool)
+    /** A click at a screen position. */
+    Click(x: int, y: int)
+    /** The wheel, in lines: positive scrolls down. */
+    Wheel(lines: int)
+    /** The terminal's new size. */
+    Resized(w: int, h: int)
+
+/** What the status bar is asking, if anything. */
+enum Prompt
+    Idle
+    /** "Save changes?" before quitting with unsaved changes. */
+    Quitting
+    /** A line number to go to. */
+    GoingTo
+    /** A name to save an unnamed buffer as. */
+    Naming
+
+/** A cursor: its offset and the line it is on. */
+type Spot = (u64, u64)
+
+struct Editor
+    text: Text
+
+    /** The cursor, at the start of a character, never past its line's text. */
+    at: u64
+    line: u64
+
+    /** The screen column an up or down move aims for, kept until a move along the line. */
+    goal: Option[u64]
+
+    /** The first line on screen, and the first screen column of the text. */
+    top: u64
+    left: u64
+
+    w: int
+    h: int
+    tab: u64
+
+    prompt: Prompt
+    entry: Buf[u8]
+
+    /** Whether the save the prompt is for is the last thing before quitting. */
+    quit_after: bool
+
+    /** What the status bar says until the next key. */
+    message: string
+
+    /** Set when the editor is to exit. */
+    done: bool
+
+    /** The cursor before and after the edit that made each version, by version. */
+    before: Buf[Spot]
+    after: Buf[Spot]
+
+    // ---- layout ------------------------------------------------------------------------------
+
+    /** The number of text rows: the screen less the status bar and the key bar. */
+    rows(self) -> u64 = if self.h > 2 then u64(self.h - 2) else 1
+
+    /** The gutter's width: the digits of the last line number it may show, and a space. */
+    gutter(*self) -> u64
+        val last = if self.text.lines_known() then self.text.line_count() else self.top + self.rows()
+
+        digits(last) + 1
+
+    /** How many screen columns of text are shown beside the gutter. */
+    text_width(*self) -> u64
+        val g = self.gutter()
+
+        if u64(self.w) > g + 1 then u64(self.w) - g else 1
+
+    // ---- reading the text --------------------------------------------------------------------
+
+    /** Whether line `n` exists: the text has `n` line breaks. */
+    has_line(*self, n: u64) -> bool
+        if n == 0 then return true
+
+        val s = self.text.line_start(n)
+
+        s > 0 && self.text.byte_at(s - 1) == u8('\n') && self.text.line_start(n - 1) < s
+
+    /** The last line, which counts every line break once. */
+    last_line(*self) -> u64 = self.text.line_of(self.text.size())
+
+    /** The character at `at` and how many bytes it takes. */
+    char_at(*self, at: u64) -> (char, u64)
+        val chunk = self.text.chunk_at(at)
+
+        if chunk.len >= 4 then return first_char(chunk[0..<4])
+
+        first_char(self.text.bytes(at, min(at + 4, self.text.size())).view())
+
+    /** The screen column of `at` on line `line`, and its column in characters. */
+    column(*self, line: u64, at: u64) -> (u64, u64)
+        var off = self.text.line_start(line)
+        var col: u64 = 0
+        var chars: u64 = 0
+
+        while off < at
+            val (c, len) = self.char_at(off)
+
+            col += cells(c, col, self.tab)
+            chars += 1
+            off += len
+
+        (col, chars)
+    end column
+
+    /** The offset on line `line` nearest screen column `goal` without passing it: a column inside a
+     * tab or a wide character is the start of it.
+     */
+    at_column(*self, line: u64, goal: u64) -> u64
+        val end = self.text.line_end(line)
+        var off = self.text.line_start(line)
+        var col: u64 = 0
+
+        while off < end
+            val (c, len) = self.char_at(off)
+            val span = cells(c, col, self.tab)
+
+            if span > 0 && col + span > goal then break
+            col += span
+            off += len
+
+        off
+    end at_column
+
+    /** Past the character at `at` and the combining marks after it. */
+    cluster_end(*self, at: u64, end: u64) -> u64
+        var off = at + self.char_at(at).1
+
+        while off < end && is_mark(self.char_at(off).0) do off += self.char_at(off).1
+        off
+
+    /** Back to the start of the character before `at`, past any combining marks on it. */
+    cluster_start(*self, at: u64, start: u64) -> u64
+        var off = self.text.char_start(at - 1)
+
+        while off > start && is_mark(self.char_at(off).0) do off = self.text.char_start(off - 1)
+        off
+
+    /** Where line `line`'s indentation ends. */
+    indent_end(*self, line: u64) -> u64
+        val end = self.text.line_end(line)
+        var off = self.text.line_start(line)
+
+        while off < end && is_blank(self.text.byte_at(off)) do off += 1
+        off
+
+    // ---- moving ------------------------------------------------------------------------------
+
+    place(*self, at: u64, line: u64)
+        self.at = at
+        self.line = line
+        self.goal = None
+
+    left_one(*self)
+        val start = self.text.line_start(self.line)
+
+        if self.at > start then
+            self.place(self.cluster_start(self.at, start), self.line)
+        elif self.line > 0 then
+            self.place(self.text.line_end(self.line - 1), self.line - 1)
+
+    right_one(*self)
+        val end = self.text.line_end(self.line)
+
+        if self.at < end then
+            self.place(self.cluster_end(self.at, end), self.line)
+        elif self.has_line(self.line + 1) then
+            self.place(self.text.line_start(self.line + 1), self.line + 1)
+
+    word_left(*self)
+        val start = self.text.line_start(self.line)
+
+        if self.at <= start then return self.left_one()
+
+        var off = self.at
+
+        while off > start && !is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
+        while off > start && is_word(self.char_at(self.text.char_start(off - 1)).0) do off = self.text.char_start(off - 1)
+        self.place(off, self.line)
+    end word_left
+
+    word_right(*self)
+        val end = self.text.line_end(self.line)
+
+        if self.at >= end then return self.right_one()
+
+        var off = self.at
+
+        while off < end && !is_word(self.char_at(off).0) do off += self.char_at(off).1
+        while off < end && is_word(self.char_at(off).0) do off += self.char_at(off).1
+        self.place(off, self.line)
+    end word_right
+
+    /** Up (`by` negative) or down `by` lines, as far as there are lines, aiming for the goal column. */
+    vertical(*self, by: i64)
+        val goal = self.goal match
+            Some(g) -> g
+            None -> self.column(self.line, self.at).0
+
+        var line = self.line
+
+        if by < 0 then
+            line -= min(line, u64(-by))
+        elif self.has_line(line + u64(by)) then
+            line += u64(by)
+        elif self.has_line(line + 1) then
+            line = self.last_line()
+
+        self.at = self.at_column(line, goal)
+        self.line = line
+        self.goal = Some(goal)
+    end vertical
+
+    /** A page up or down: the view moves a page, and the cursor with it. */
+    page(*self, by: i64)
+        val rows = self.rows()
+
+        self.vertical(by * i64(rows))
+        if by < 0 then
+            self.top -= min(self.top, rows)
+        else
+            self.top = min(self.top + rows, self.line)
+
+    /** Home goes to the end of the indentation, and from there to the start of the line. */
+    home(*self)
+        val indent = self.indent_end(self.line)
+
+        self.place(if self.at != indent then indent else self.text.line_start(self.line), self.line)
+
+    /** Line `n` (from 0), or the last line for one past it, at character column `col`, shown in the
+     * middle of the screen.
+     */
+    goto(*self, n: u64, col: u64)
+        val line = if self.has_line(n) then n else self.last_line()
+        val half = self.rows() / 2
+
+        self.place(self.text.offset_at(line, col), line)
+        self.top = if line > half then line - half else 0
+
+    // ---- editing -----------------------------------------------------------------------------
+
+    /** Records the edit just made: the cursor before it, and where it is now. */
+    edited(*self, before: Spot)
+        val now = self.text.now
+
+        self.before.truncate(now)
+        self.after.truncate(now)
+        self.before.push(before)
+        self.after.push((self.at, self.line))
+        self.goal = None
+
+    insert(*self, bytes: []const u8)
+        val before = (self.at, self.line)
+
+        self.text.insert(self.at, bytes)
+        self.at += bytes.len
+        for b in bytes do if b == u8('\n') then self.line += 1
+        self.edited(before)
+
+    /** Removes `from..<to`, leaving the cursor at `from` on line `line`. */
+    remove(*self, from: u64, to: u64, line: u64)
+        val before = (self.at, self.line)
+
+        self.text.delete(from, to - from)
+        self.at = from
+        self.line = line
+        self.edited(before)
+
+    /** A line break of the kind the line already ends with, and the line's indentation up to the
+     * cursor.
+     */
+    newline(*self)
+        val start = self.text.line_start(self.line)
+        val crlf = self.text.line_start(self.line + 1) - self.text.line_end(self.line) == 2
+        var bytes: Buf[u8] = buf()
+
+        bytes.extend(if crlf then "\r\n".bytes else "\n".bytes)
+        bytes.extend(self.text.bytes(start, min(self.indent_end(self.line), self.at)).view())
+        self.insert(bytes.view())
+
+    backspace(*self)
+        val start = self.text.line_start(self.line)
+
+        if self.at > start then
+            self.remove(self.text.char_start(self.at - 1), self.at, self.line)
+        elif self.line > 0 then
+            self.remove(self.text.line_end(self.line - 1), self.at, self.line - 1)
+
+    delete(*self)
+        val end = self.text.line_end(self.line)
+
+        if self.at < end then
+            self.remove(self.at, self.cluster_end(self.at, end), self.line)
+        elif self.has_line(self.line + 1) then
+            self.remove(end, self.text.line_start(self.line + 1), self.line)
+
+    undo(*self)
+        if self.text.undo() then
+            val (at, line) = self.before[self.text.now + 1]
+
+            self.place(at, line)
+
+    redo(*self)
+        if self.text.redo() then
+            val (at, line) = self.after[self.text.now]
+
+            self.place(at, line)
+
+    // ---- saving and quitting -----------------------------------------------------------------
+
+    /** Saves to the document's name, or asks for one; true when the text is now on disk. */
+    save(*self) -> bool
+        if self.text.path.len == 0
+            self.prompt = Naming
+            self.entry.clear()
+            return false
+
+        self.save_as(self.text.path)
+
+    save_as(*self, path: string) -> bool = self.text.save_as(path) match
+        Ok(_) ->
+            self.message = s"Saved $path"
+            true
+        Err(e) ->
+            self.message = s"Could not save $path: $e"
+            false
+
+    quit(*self)
+        if self.text.modified() then self.prompt = Quitting else self.done = true
+
+    // ---- input -------------------------------------------------------------------------------
+
+    /** Does what `input` asks. */
+    handle(*self, input: Input)
+        if input is Resized(w, h)
+            self.w = w
+            self.h = h
+            return self.follow()
+
+        self.message = ""
+        if self.prompt != Idle then return self.answer(input)
+
+        input match
+            Type(c) -> self.insert(string(c).bytes)
+            Press(key, ctrl) -> self.press(key, ctrl)
+            Click(x, y) -> self.click(x, y)
+            Wheel(n) -> return self.scroll(n)
+            Resized(_, _) -> ()
+
+        self.follow()
+    end handle
+
+    press(*self, key: Key, ctrl: bool)
+        key match
+            Left -> if ctrl then self.word_left() else self.left_one()
+            Right -> if ctrl then self.word_right() else self.right_one()
+            Up -> self.vertical(-1)
+            Down -> self.vertical(1)
+            PageUp -> self.page(-1)
+            PageDown -> self.page(1)
+            Home -> if ctrl then self.place(0, 0) else self.home()
+            End -> if ctrl then self.place(self.text.size(), self.last_line()) else self.place(self.text.line_end(self.line), self.line)
+            Enter -> self.newline()
+            Tab -> self.insert("\t".bytes)
+            Space -> self.insert(" ".bytes)
+            Backspace | Backspace2 -> self.backspace()
+            Delete -> self.delete()
+            CtrlZ -> self.undo()
+            CtrlY -> self.redo()
+            CtrlS -> self.save()
+            CtrlQ -> self.quit()
+            CtrlG ->
+                self.prompt = GoingTo
+                self.entry.clear()
+            _ -> ()
+
+    /** A key while the status bar is asking something. */
+    answer(*self, input: Input)
+        if self.prompt == Quitting
+            input match
+                Type(c) ->
+                    if c == 'y' || c == 'Y'
+                        self.prompt = Idle
+                        self.quit_after = true
+                        if self.save() then self.done = true
+                    elif c == 'n' || c == 'N'
+                        self.done = true
+                Press(key, _) -> if key == Esc || key == CtrlC || key == CtrlQ then self.prompt = Idle
+                _ -> ()
+            return
+
+        input match
+            Type(c) -> self.entry.extend(string(c).bytes)
+            Press(key, _) -> key match
+                Space -> self.entry.push(u8(' '))
+                Backspace | Backspace2 -> pop_char(&self.entry)
+                Enter -> self.submit()
+                Esc | CtrlC | CtrlQ ->
+                    self.prompt = Idle
+                    self.quit_after = false
+                _ -> ()
+            _ -> ()
+    end answer
+
+    /** The answer typed into a prompt. */
+    submit(*self)
+        val asked = self.prompt
+        val entry = from_utf8_lossy(self.entry.view())
+
+        self.prompt = Idle
+        if asked == GoingTo
+            self.go(entry)
+        elif entry.len == 0
+            self.message = "Not saved"
+        elif self.save_as(entry) && self.quit_after
+            self.done = true
+
+        self.quit_after = false
+        self.follow()
+    end submit
+
+    /** `line` or `line:column`, both counted from 1. */
+    go(*self, entry: string)
+        val parts = split(entry, ":")
+        val line = parse_ulong(parts[0]).unwrap_or(0)
+        val col = if parts.len > 1 then parse_ulong(parts[1]).unwrap_or(0) else 1
+
+        if parts.len > 2 || line == 0 || col == 0
+            self.message = s"Not a line number: $entry"
+        else
+            self.goto(line - 1, col - 1)
+
+    click(*self, x: int, y: int)
+        if y < 0 || u64(y) >= self.rows() then return
+
+        var line = self.top + u64(y)
+
+        if !self.has_line(line) then line = self.last_line()
+
+        val g = self.gutter()
+        val col = if x > 0 && u64(x) > g then u64(x) - g else 0
+
+        self.place(self.at_column(line, self.left + col), line)
+
+    /** Moves the view, not the cursor; never past the last line. */
+    scroll(*self, by: int)
+        if by < 0 then
+            self.top -= min(self.top, u64(-by))
+        else
+            var top = self.top + u64(by)
+
+            while top > self.top && !self.has_line(top) do top -= 1
+            self.top = top
+
+    /** Moves the view so that the cursor is on it. */
+    follow(*self)
+        val rows = self.rows()
+
+        if self.line < self.top then
+            self.top = self.line
+        elif self.line >= self.top + rows then
+            self.top = self.line - rows + 1
+
+        val col = self.column(self.line, self.at).0
+        val width = self.text_width()
+
+        if col < self.left then
+            self.left = col
+        elif col >= self.left + width then
+            self.left = col - width + 1
+    end follow
+
+    // ---- drawing -----------------------------------------------------------------------------
+
+    render(*self, g: *Grid)
+        g.reset(self.w, self.h)
+
+        val rows = self.rows()
+        val gutter = self.gutter()
+        val width = self.text_width()
+
+        for y in 0..<rows
+            val n = self.top + y
+
+            if !self.has_line(n) then break
+
+            val label = s"${n + 1}"
+
+            g.write(int(gutter - 1 - label.len), int(y), label, DIM, DEFAULT)
+            self.draw_line(g, n, int(y), gutter, width)
+
+        if self.h > 1 then self.status(g, int(rows))
+        if self.h > 2 then self.keys(g, int(rows) + 1)
+
+        if self.prompt == GoingTo || self.prompt == Naming then return
+
+        val (col, _) = self.column(self.line, self.at)
+
+        if self.line >= self.top && self.line < self.top + rows && col >= self.left && col < self.left + width
+            g.cursor = Some((int(gutter + col - self.left), int(self.line - self.top)))
+    end render
+
+    draw_line(*self, g: *Grid, n: u64, y: int, gutter: u64, width: u64)
+        val end = self.text.line_end(n)
+        val stop = self.left + width
+        var off = self.text.line_start(n)
+        var col: u64 = 0
+
+        while off < end && col < stop
+            val (c, len) = self.char_at(off)
+            val span = cells(c, col, self.tab)
+
+            if c != '\t' && span > 0 && col >= self.left && col + span <= stop
+                val ch = if wcwidth(u32(c)) < 0 then 0xFFFD else u32(c)
+
+                g.glyph(int(gutter + col - self.left), y, ch, int(span), DEFAULT, DEFAULT)
+
+            col += span
+            off += len
+    end draw_line
+
+    /** The file, whether it is modified, and where the cursor is -- or the question being asked. */
+    status(*self, g: *Grid, y: int)
+        for x in 0..<self.w do g.put(x, y, u32(' '), DEFAULT | REVERSE, DEFAULT)
+
+        val say = self.prompt match
+            Quitting -> "Save changes before quitting?"
+            GoingTo -> s"Go to line: ${from_utf8_lossy(self.entry.view())}"
+            Naming -> s"Save as: ${from_utf8_lossy(self.entry.view())}"
+            Idle -> if self.message.len > 0 then self.message else self.title()
+
+        val end = g.write(1, y, say, DEFAULT | REVERSE | BOLD, DEFAULT)
+
+        if self.prompt == GoingTo || self.prompt == Naming
+            g.cursor = Some((end, y))
+            return
+
+        val (_, chars) = self.column(self.line, self.at)
+        val total = if self.text.lines_known() then s" of ${self.text.line_count()}" else ""
+        val place = s"Ln ${self.line + 1}$total, Col ${chars + 1} "
+
+        val room = int(place.len)
+
+        if end + 2 + room <= self.w then g.write(self.w - room, y, place, DEFAULT | REVERSE, DEFAULT)
+    end status
+
+    title(self) -> string
+        val name = if self.text.path.len > 0 then self.text.path else "[No name]"
+
+        if self.text.modified() then s"$name (modified)" else name
+
+    /** The keys that work now, the way nano shows them. */
+    keys(*self, g: *Grid, y: int)
+        val shown: []const (string, string) = self.prompt match
+            Idle -> [("^S", "Save"), ("^Q", "Quit"), ("^G", "Go to line"), ("^Z", "Undo"), ("^Y", "Redo")]
+            Quitting -> [("Y", "Yes"), ("N", "No"), ("Esc", "Cancel")]
+            GoingTo -> [("Enter", "Go"), ("Esc", "Cancel")]
+            Naming -> [("Enter", "Save"), ("Esc", "Cancel")]
+
+        var x = 0
+
+        for (key, label) in shown
+            x = g.write(x, y, key, DEFAULT | REVERSE, DEFAULT)
+            x = g.write(x + 1, y, label, DEFAULT, DEFAULT) + 2
+    end keys
+end Editor
+
+/** An editor over `text`, on a screen `w` by `h`. */
+editor(text: Text, w: int = 80, h: int = 24, tab: u64 = tab_width) -> Editor
+    var before: Buf[Spot] = buf()
+    var after: Buf[Spot] = buf()
+
+    before.push((0, 0))
+    after.push((0, 0))
+    Editor(text, 0, 0, None, 0, 0, w, h, tab, Idle, buf(), false, "", false, before, after)
+
+/** The editor for `te <path>`: the file, a new file of that name where there is none, or an unnamed
+ * buffer for an empty path. Any other failure to open it is the error.
+ */
+load(path: string) -> Result[Editor, string]
+    if path.len == 0 then return Ok(editor(empty("")))
+
+    open(path) match
+        Ok(t) -> Ok(editor(t))
+        Err(NotFound) ->
+            var ed = editor(empty(path))
+
+            ed.message = s"New file $path"
+            Ok(ed)
+        Err(e) -> Err(s"$path: $e")
+end load
+
+/** How many screen columns `c` takes at column `col`. A character with no printed form is drawn as
+ * U+FFFD, one column.
+ */
+cells(c: char, col: u64, tab: u64) -> u64
+    if c == '\t' then return tab - col % tab
+
+    val w = wcwidth(u32(c))
+
+    if w < 0 then 1 else u64(w)
+
+/** A combining mark or another character drawn on the one before it. */
+is_mark(c: char) -> bool = c != '\t' && wcwidth(u32(c)) == 0
+
+/** What a Ctrl+arrow word move stops at the edges of. */
+is_word(c: char) -> bool =
+    c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || u32(c) >= 0x80
+
+is_blank(b: u8) -> bool = b == u8(' ') || b == u8('\t')
+
+private first_char(b: []const u8) -> (char, u64)
+    var cs = chars_of(b)
+    val c = cs.next().unwrap()
+
+    (c, cs.offset)
+
+private digits(n: u64) -> u64
+    var d: u64 = 1
+    var m = n
+
+    while m >= 10
+        m /= 10
+        d += 1
+
+    d
+
+/** Removes the last character of `b`. */
+private pop_char(b: *Buf[u8])
+    while b.pop() is Some(x) && (x & 0xC0) == 0x80 do ()

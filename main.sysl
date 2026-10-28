@@ -1,10 +1,62 @@
-// `te <file>`: for now, opens the file and says what it holds. The editing view comes next
-// (`docs/design.md § Milestones`).
+// `te [file]`: edits `file`, a new file of that name if there is none, or an unnamed buffer.
+//
+// Everything the editor decides is in `Editor` (`editor.sysl`), which draws into a `Grid`; this file
+// is the terminal: it turns termbox's events into `Input`, and copies the grid to the screen.
+
+import sysl.fs.Interrupted
+import sysl.text.char_from_u32
+import sh.sysl.termbox2.{Event, Keyboard, Resize, Mouse, UnknownEvent, Key, InputMode, init, shutdown, width, height, clear, set_cell, set_cursor, hide_cursor, present, poll_event, set_input_mode}
 
 main(args: []string) -> Result[unit, string]
-    if args.len != 2 then return Err("usage: te <file>")
+    if args.len > 2 then return Err("usage: te [file]")
 
-    var t = open(args[1]).map_err(e -> s"${args[1]}: $e")?
+    var ed = load(if args.len == 2 then args[1] else "")?
 
-    print(s"${args[1]}: ${t.size()} bytes, ${t.line_count()} lines")
-    Ok(())
+    init().map_err(e -> s"cannot start the terminal: ${e.message()}")?
+
+    val ran = run(&ed)
+
+    shutdown().unwrap_or(())
+    ran
+end main
+
+/** Draws, waits for input, and does what it asks, until the editor is done. */
+run(ed: *Editor) -> Result[unit, string]
+    set_input_mode(InputMode(false, true)).map_err(e -> e.message())?
+    ed.handle(Resized(width().unwrap_or(80), height().unwrap_or(24)))
+
+    var g = grid()
+
+    loop
+        ed.render(&g)
+        show(g)
+        if ed.done then return Ok(())
+
+        poll_event() match
+            Ok(ev) -> if input_of(ev) is Some(i) then ed.handle(i)
+            Err(e) -> if e.errno() != Interrupted.code() then return Err(e.message())
+end run
+
+/** What an event asks the editor, if anything. */
+input_of(ev: Event) -> Option[Input] = ev.kind match
+    Keyboard -> if ev.ch != 0 then char_from_u32(ev.ch).map(c -> Type(c)) else Some(Press(ev.key, ev.ctrl()))
+    Resize -> Some(Resized(ev.w, ev.h))
+    Mouse -> ev.key match
+        MouseLeft -> Some(Click(ev.x, ev.y))
+        MouseWheelUp -> Some(Wheel(-3))
+        MouseWheelDown -> Some(Wheel(3))
+        _ -> None
+    UnknownEvent -> None
+
+/** Copies the grid to termbox's back buffer and sends what changed. */
+show(g: Grid)
+    clear().unwrap_or(())
+    for y in 0..<g.h
+        for x in 0..<g.w
+            val cell = g.at(x, y)
+
+            if cell.ch != 0 then set_cell(x, y, cell.ch, cell.fg, cell.bg).unwrap_or(())
+
+    if g.cursor is Some((x, y)) then set_cursor(x, y).unwrap_or(()) else hide_cursor().unwrap_or(())
+    present().unwrap_or(())
+end show

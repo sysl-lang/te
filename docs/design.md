@@ -90,6 +90,15 @@ changed, which is what keeps it fast over a slow ssh link. Each cell is a graphe
 display width (0, 1 or 2 columns); a long line scrolls horizontally rather than wrapping in the first
 version.
 
+**The editor never draws to the terminal itself.** `Editor` (`editor.sysl`) holds the cursor (a byte
+offset and the line it is on, both kept as it moves, so no offset is ever turned back into a line by
+counting), the viewport, and what each key does, and renders into a `Grid` of cells
+(`screen.sysl`); `main.sysl` turns termbox's events into `Input` and copies the grid to termbox. So
+the tests drive the editor with keys and read the grid, with no terminal. Display widths are
+termbox's own `wcwidth`, the table it lays the cells out with, so the cursor and the cells cannot
+disagree. Combining marks take no column and move with the character before them, but are not drawn
+yet: the termbox2 package is built without `TB_OPT_EGC`, so a cell cannot hold a cluster.
+
 ## Milestones
 
 1. **Core** — the piece tree over the mapped file and the add buffer, undo/redo, byte and line

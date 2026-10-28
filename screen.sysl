@@ -1,0 +1,81 @@
+// What the editor draws, as cells, before anything reaches a terminal.
+//
+// **The editor renders into a `Grid` and never into termbox**, so everything it decides -- which
+// rows are shown, where a wide character lands, what the status bar says, where the cursor is -- is
+// a value a test can read without a terminal. `main` copies the grid into termbox's back buffer, and
+// termbox sends only the cells that changed.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sh.sysl.termbox2.{DEFAULT, wcwidth}
+
+/** One cell: a codepoint and its two attributes. A codepoint of 0 is the second column of the wide
+ * character to its left, which termbox draws as part of that character.
+ */
+struct Cell
+    ch: u32
+    fg: u64
+    bg: u64
+
+/** A screen's worth of cells, and where the cursor is, if it is shown. */
+struct Grid
+    w: int
+    h: int
+    cells: Buf[Cell]
+    cursor: Option[(int, int)]
+
+    /** Every cell blank, at a new size, and the cursor hidden. */
+    reset(*self, w: int, h: int)
+        self.w = w
+        self.h = h
+        self.cells.clear()
+        for _ in 0..<w * h do self.cells.push(Cell(u32(' '), DEFAULT, DEFAULT))
+        self.cursor = None
+
+    at(self, x: int, y: int) -> Cell = self.cells[y * self.w + x]
+
+    /** Sets one cell; a position off the grid is ignored. */
+    put(*self, x: int, y: int, ch: u32, fg: u64, bg: u64)
+        if x >= 0 && x < self.w && y >= 0 && y < self.h then self.cells.set(usize(y * self.w + x), Cell(ch, fg, bg))
+
+    /** A character `width` columns wide at `x`: a wide one also takes the cell after it. */
+    glyph(*self, x: int, y: int, ch: u32, width: int, fg: u64, bg: u64)
+        self.put(x, y, ch, fg, bg)
+        for i in 1..<width do self.put(x + i, y, 0, fg, bg)
+
+    /** `s` from `x`, and the column after it. A combining mark has no cell of its own and is not
+     * drawn: termbox is built without grapheme-cluster cells, so it cannot put one on its base.
+     */
+    write(*self, x: int, y: int, s: string, fg: u64, bg: u64) -> int
+        var col = x
+
+        for c in s.chars
+            val w = wcwidth(u32(c))
+
+            if w < 0
+                self.put(col, y, 0xFFFD, fg, bg)
+                col += 1
+            elif w > 0
+                self.glyph(col, y, u32(c), w, fg, bg)
+                col += w
+
+        col
+    end write
+
+    /** Row `y` as text, without its trailing blanks: what a reader of the screen would see. */
+    row(self, y: int) -> string
+        var out: Buf[u8] = buf()
+
+        for x in 0..<self.w
+            val ch = self.at(x, y).ch
+
+            if ch != 0 then out.extend(string(char(ch)).bytes)
+
+        var end = out.len()
+
+        while end > 0 && out[end - 1] == u8(' ') do end -= 1
+        from_utf8_lossy(out.view()[0..<end])
+    end row
+end Grid
+
+grid() -> Grid = Grid(0, 0, buf(), None)
