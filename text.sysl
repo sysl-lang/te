@@ -1,5 +1,5 @@
 import sysl.buf.{Buf, buf}
-import sysl.fs.{IoError, File, Mapped, map_file, create, metadata, set_permissions, pending_name, publish_file, remove_file}
+import sysl.fs.{IoError, File, Mapped, Advice, map_file, create, metadata, set_permissions, pending_name, publish_file, remove_file}
 import sysl.math.{min, max}
 
 // The text being edited: a piece table held as a balanced persistent tree.
@@ -229,7 +229,7 @@ struct Text
     private piece_lines(*self, x: &Node) -> i64
         if x.lines < 0
             x.lines = self.newlines(self.piece(x.src, x.start, x.len))
-            if x.src > 0 then release(self.sources[x.src - 1], x.start, x.len)
+            if x.src > 0 then self.sources[x.src - 1].advise(DontNeed, usize(x.start), usize(x.len))
 
         x.lines
 
