@@ -356,7 +356,7 @@ struct Text
         if self.now <= since + 1 then return
 
         if self.saved is Some(v) && v > since then self.saved = if v == self.now then Some(since + 1) else None
-        self.history.set(since + 1, self.root)
+        self.history[since + 1] = self.root
         self.history.truncate(since + 2)
         self.now = since + 1
 
@@ -587,7 +587,7 @@ struct Text
                 val r = runs[last - 1]
                 val lines = if r.lines < 0 || x.lines < 0 then -1 else r.lines + x.lines
 
-                runs.set(last - 1, Run(r.start, r.len + x.len, lines))
+                runs[last - 1] = Run(r.start, r.len + x.len, lines)
             else
                 runs.push(Run(*at, x.len, x.lines))
 
@@ -635,7 +635,7 @@ struct Text
         val root = self.build(self.sources.len(), runs.view(), 0, runs.len(), 0)
 
         self.root = root
-        self.history.set(self.now, root)
+        self.history[self.now] = root
         self.saved = Some(self.now)
         self.path = path
         self.disk = stamp_of(path)
@@ -695,6 +695,6 @@ open(path: string, block: u64 = block_bytes) -> Result[Text, IoError]
 
     t.sources.push(m)
     t.root = t.mapped(1, size)
-    t.history.set(0, t.root)
+    t.history[0] = t.root
     t.disk = stamp_of(path)
     Ok(t)

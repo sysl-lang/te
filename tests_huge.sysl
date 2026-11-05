@@ -602,11 +602,11 @@ private long_row(line: string, left: u64, width: u64) -> string
         val glyph = if c == '\t' then " " else string(c)
 
         if w > 0 && off >= left && off + w <= left + width
-            cells.set(usize(off - left), glyph)
-            for i in 1..<w do cells.set(usize(off - left + i), "")
+            cells[usize(off - left)] = glyph
+            for i in 1..<w do cells[usize(off - left + i)] = ""
             last = i64(off - left)
         elif w == 0 && last >= 0
-            cells.set(usize(last), cells[usize(last)] + glyph)
+            cells[usize(last)] = cells[usize(last)] + glyph
         else
             last = -1
 

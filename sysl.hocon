@@ -10,7 +10,7 @@
 package {
   name    = "te"
   version = "0.1.0"
-  sysl    = "0.7.9"
+  sysl    = "0.9.0"
 }
 
 optimization = "2"
@@ -27,5 +27,5 @@ requires {
 // screen for their syntax colours, with the grammars it carries.
 dependencies {
   termbox2    { git = "github.com/sysl-lang/termbox2", version = "0.4.0" }
-  highlighter { git = "github.com/sysl-lang/highlighter", version = "0.2.0" }
+  highlighter { git = "github.com/sysl-lang/highlighter", version = "0.2.1" }
 }
