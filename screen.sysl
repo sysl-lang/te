@@ -40,7 +40,7 @@ struct Grid
 
     /** Sets one cell; a position off the grid is ignored. */
     put(*self, x: int, y: int, ch: u32, fg: u64, bg: u64)
-        if x >= 0 && x < self.w && y >= 0 && y < self.h then self.cells.set(usize(y * self.w + x), Cell(ch, "", fg, bg))
+        if x >= 0 && x < self.w && y >= 0 && y < self.h then self.cells[usize(y * self.w + x)] = Cell(ch, "", fg, bg)
 
     /** A character `width` columns wide at `x`: a wide one also takes the cell after it. */
     glyph(*self, x: int, y: int, ch: u32, width: int, fg: u64, bg: u64)
@@ -53,7 +53,7 @@ struct Grid
             val i = usize(y * self.w + x)
             val cell = self.cells[i]
 
-            if cell.ch != 0 then self.cells.set(i, Cell(cell.ch, cell.marks + string(char(ch)), cell.fg, cell.bg))
+            if cell.ch != 0 then self.cells[i] = Cell(cell.ch, cell.marks + string(char(ch)), cell.fg, cell.bg)
 
     /** `s` from `x`, and the column after it. A combining mark has no column of its own and joins the
      * character before it.

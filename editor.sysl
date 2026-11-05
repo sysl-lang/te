@@ -532,7 +532,7 @@ struct Editor
         self.text.squash(since)
         self.before.truncate(since + 2)
         self.after.truncate(since + 2)
-        self.after.set(since + 1, after)
+        self.after[since + 1] = after
 
     /** Folds the edit just made, which made version `since + 1`, into the one before it when both
      * belong to one run of `kind` (the rules are at the top of this file). `c` is the character
