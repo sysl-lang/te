@@ -1,5 +1,9 @@
 github.com/sysl-lang/highlighter v0.2.1 sha256:3dfcf7a4b122c4ef762bac2e2591e06a663a231d95a2eef25e1ff2570ed4d61e
+github.com/sysl-lang/highlighter v0.2.2 sha256:93efe0df6213572a9b79fbf7e6e7bba9a468b0d607370d42b8752d52923b5bf2
 github.com/sysl-lang/json v0.2.4 sha256:9dbc05db3559ebac3286fda5f4ab0c3991ba748c3b82f982b930168f049bc40d
+github.com/sysl-lang/json v0.2.5 sha256:85fc04b6986477b6de0623754ecec91123aea24144dfdfb258153f2c12315651
 github.com/sysl-lang/oniguruma v0.1.4 sha256:2552d8684933d536c851f3368dbadaa2c1ef2168d2347ae57bad00b866ea8e68
+github.com/sysl-lang/oniguruma v0.1.5 sha256:753f9bab5083efc20dfbd8db61a29ab66263793d24ab92dd11f1b9ea91f3a57e
 github.com/sysl-lang/parsing v0.14.1 sha256:a8da830d00560772bc997c0f58d61d22a65fdcabd66c95c685528eb241c08038
+github.com/sysl-lang/parsing v0.14.2 sha256:6a71afa1772c34482ca86d0d1af334e49f2fc19cf88356028b86b17335a42bcb
 github.com/sysl-lang/termbox2 v0.4.0 sha256:79d8ed18140fd9aca23123bac23b4b086d30db6540c6a834c92c9a117508ee10
